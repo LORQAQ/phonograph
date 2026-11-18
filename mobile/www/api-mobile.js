@@ -323,11 +323,6 @@
       }
     }
 
-    if (p === '/api/stream') {
-      const r = await resolveUrl(q.get('id'), q.get('source') || 'wy', q.get('quality'))
-      return r
-    }
-
     if (p === '/api/pic') {
       const direct = q.get('url')
       if (direct) return { url: direct }
@@ -347,12 +342,39 @@
     }
 
     if (p === '/api/playlist') {
-      const action = body.action || q.get('action')
-      if (action === 'preview' || action === 'import') {
-        const res2 = await importPlaylistMobile(body.url || q.get('url') || '')
-        return res2
+      const action0 = body.action || q.get('action')
+      const d0 = db()
+
+      /* B1: preview 和 import 必须按前端期望的结构返回 */
+      if (action0 === 'preview' || action0 === 'import') {
+        const url = body.url || q.get('url') || ''
+        const r0 = await importPlaylistMobile(url)
+        const songs = r0.songs || []
+        if (action0 === 'preview') {
+          return {
+            preview: { name: r0.name, count: songs.length, platform: r0.platform, cover: r0.cover || '' },
+            songs,
+          }
+        }
+        /* import：落库并返回 playlists + imported */
+        const pl = {
+          id: 'pl' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+          name: r0.name || '导入歌单',
+          songs,
+          platform: r0.platform,
+          cover: r0.cover || '',
+          createdAt: Date.now(),
+        }
+        if (!Array.isArray(d0.playlists)) d0.playlists = []
+        d0.playlists.push(pl)
+        saveDb(d0)
+        return {
+          playlists: d0.playlists,
+          imported: { id: pl.id, name: pl.name, count: songs.length, platform: r0.platform },
+        }
       }
-      const d = db()
+
+      const d = d0
       if (opts.method === 'POST') {
         const action = body.action
         if (action === 'create') {
@@ -369,12 +391,28 @@
           saveDb(d); return { playlists: d.playlists }
         }
         if (action === 'add') {
-          const pl = d.playlists.find((x) => x.id === body.id)
+          /* B2: 兼容前端传的 listId / song */
+          const listId = body.listId || body.id
+          const pl = d.playlists.find((x) => x.id === listId)
           if (pl && body.song) {
-            const key = (s) => (s.source || 'wy') + '|' + s.id
+            const key = (s) => (s.source || 'wy') + '|' + String(s.id)
             if (!pl.songs.some((s) => key(s) === key(body.song))) pl.songs.push(body.song)
+            saveDb(d)
+            return { ok: true, playlists: d.playlists }
           }
-          saveDb(d); return { playlists: d.playlists }
+          throw new Error('歌单不存在：' + listId)
+        }
+        if (action === 'remove') {
+          /* B2: 兼容 listId/songId 与 id/id */
+          const listId = body.listId || body.id
+          const songId = body.songId || (body.song && body.song.id)
+          const pl = d.playlists.find((x) => x.id === listId)
+          if (pl) {
+            pl.songs = (pl.songs || []).filter((s) => String(s.id) !== String(songId))
+            saveDb(d)
+            return { ok: true, playlists: d.playlists }
+          }
+          throw new Error('歌单不存在：' + listId)
         }
         if (action === 'remove') {
           const pl = d.playlists.find((x) => x.id === body.id)

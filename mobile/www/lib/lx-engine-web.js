@@ -186,6 +186,7 @@
 
   class LxScript {
     constructor (id, code) {
+    this.logs = []   /* B24: 音源日志 */
       this.id = id
       this.code = code
       this.meta = parseMeta(code)
@@ -328,6 +329,8 @@
         console.log('[音源] 加载完成，可用', this.scripts.size, '个 / 共', items.length, '个')
         return this.scripts.size
       })()
+      /* B8: 完成后释放锁，否则 reload 永远拿到旧 Promise */
+      this.loading.then(() => { this.loading = null }).catch(() => { this.loading = null })
       return this.loading
     },
 
@@ -362,7 +365,9 @@
       const order = platform === 'kg' ? PRIO_KG : PRIO
       const want = only ? [only].concat(order.filter((x) => x !== only)) : order
 
-      const list = want.map((id) => this.scripts.get(id)).filter(Boolean)
+      /* B9: 过滤被禁用的音源 */
+      const isDisabled = (id) => this.disabled && this.disabled.has && this.disabled.has(id)
+      const list = want.filter((id) => !isDisabled(id)).map((id) => this.scripts.get(id)).filter(Boolean)
       if (!list.length) {
         /* 平台不在优先列表里，全部试一遍 */
         for (const s2 of this.scripts.values()) list.push(s2)
