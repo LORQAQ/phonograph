@@ -356,6 +356,12 @@
           console.warn('[取流] 收到外链占位，跳过', url.slice(0, 50))
           return false
         }
+        /* WebView 的 <audio> 只稳支持 mp3/m4a/flac/ogg，
+           裸 .aac/.wma/.ape 会报 MEDIA_ELEMENT_ERROR: Format error (code 4) */
+        if (/\.(aac|wma|ape|cue)(\?|$)/i.test(url)) {
+          console.warn('[取流] 格式不支持，跳过', url.slice(-40))
+          return false
+        }
         /* 不再做网络探测：HEAD 常被 CDN 拒，会误杀可用地址 */
         return true
       }

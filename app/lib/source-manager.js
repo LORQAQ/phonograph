@@ -25,6 +25,9 @@ function callWithTimeout (fn, ms = 5000) {
 function probeUrl (url, timeout = 8000) {
   /* 网易云外链是 302 占位，播放必失败 */
   if (/music\.163\.com\/song\/media\/outer/i.test(String(url || ''))) return false
+  /* WebView 的 <audio> 只稳支持 mp3/m4a/flac/ogg，
+     裸 .aac/.wma/.ape 会报 MEDIA_ELEMENT_ERROR: Format error (code 4) */
+  if (/\.(aac|wma|ape|cue)(\?|$)/i.test(String(url || ''))) return false
 
   return new Promise((resolve) => {
     let settled = false
