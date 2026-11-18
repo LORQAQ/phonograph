@@ -269,9 +269,34 @@ const routes = {
     if (!id) return json(res, 400, { error: '缺少歌曲 id' })
     const platform = q.get('source') || 'wy'
     const quality = q.get('quality') || db.settings.quality || '320k'
-    const info = await buildMusicInfo(platform, id, extraFromQuery(q))
-    const result = await sourceManager.resolveUrl(platform, info, quality, q.get('only') || '')
-    proxyStream(req, res, result.url)
+
+    /* 与 /api/url 走同一条路径：等音源就绪 + 跨平台兜底 + 缓存 */
+    const cacheKey = platform + '|' + id + '|' + quality + '|' + (q.get('only') || '')
+    let target = ''
+    const hit = urlCache.get(cacheKey)
+    if (hit && hit.exp > Date.now()) {
+      target = hit.value.url
+    } else {
+      await loadPromise.catch(() => { })
+      const info = await buildMusicInfo(platform, id, extraFromQuery(q))
+      const { result } = await resolveWithCross({
+        platform, info, quality,
+        only: q.get('only') || '',
+        sourceManager, buildMusicInfo,
+        libs: { qq, kugou },
+      })
+      target = result && result.url
+      if (target) {
+        urlCache.set(cacheKey, {
+          value: { id, source: platform, quality: result.quality, provider: result.provider, url: target },
+          exp: Date.now() + 5 * 60e3,
+        })
+        if (urlCache.size > 300) urlCache.delete(urlCache.keys().next().value)
+      }
+    }
+
+    if (!target) return json(res, 502, { error: '取不到播放地址，换一首试试' })
+    proxyStream(req, res, target)
     return null
   },
 
