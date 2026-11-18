@@ -35,7 +35,19 @@ process.on('unhandledRejection', (e) => console.warn('[warn] 未处理的 Promis
 
 /* ---------------- 数据库（JSON） ---------------- */
 function loadDb () {
-  try { return JSON.parse(fs.readFileSync(DB_FILE, 'utf8')) } catch (e) { return {} }
+  try {
+    return JSON.parse(fs.readFileSync(DB_FILE, 'utf8'))
+  } catch (e) {
+    /* B6: 解析失败时备份损坏文件，避免用户数据无声消失 */
+    try {
+      if (fs.existsSync(DB_FILE)) {
+        const bak = DB_FILE + '.bak'
+        fs.copyFileSync(DB_FILE, bak)
+        console.error('[db] 数据文件损坏，已备份到 ' + bak + '：' + e.message)
+      }
+    } catch (e2) { }
+    return {}
+  }
 }
 const db = Object.assign({
   playlists: [{ id: 'default', name: '默认列表', songs: [] }],
@@ -55,8 +67,16 @@ let saveTimer = null
 function saveDb () {
   clearTimeout(saveTimer)
   saveTimer = setTimeout(() => {
-    try { fs.mkdirSync(DATA, { recursive: true }); fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2), 'utf8') } catch (e) { console.warn('保存数据失败', e.message) }
+    try { writeDbNow() } catch (e) { console.warn('保存数据失败', e.message) }
   }, 300)
+}
+
+/* B6: 原子写 —— 先写 .tmp 再 rename，断电不会写坏原文件 */
+function writeDbNow () {
+  fs.mkdirSync(DATA, { recursive: true })
+  const tmp = DB_FILE + '.tmp'
+  fs.writeFileSync(tmp, JSON.stringify(db, null, 2), 'utf8')
+  fs.renameSync(tmp, DB_FILE)
 }
 
 /* ---------------- 音源管理 ---------------- */
@@ -214,7 +234,13 @@ const routes = {
 
   async '/api/shutdown' (req) {
     if (req.method !== 'POST') throw Object.assign(new Error('仅支持 POST'), { code: 405 })
-    setTimeout(() => { console.log('收到退出指令，服务关闭'); process.exit(0) }, 150)
+    /* B5: 退出前同步写盘，避免最后一次修改丢失 */
+    try {
+      if (saveTimer) { clearTimeout(saveTimer); saveTimer = null }
+      writeDbNow()
+      console.log('数据已保存')
+    } catch (e) { console.error('[db] 退出前保存失败', e.message) }
+    setTimeout(() => { console.log('收到退出指令，服务关闭'); process.exit(0) }, 300)
     return { ok: true, message: '服务即将退出' }
   },
 
@@ -392,11 +418,31 @@ const routes = {
   async '/api/downloads/remove' (req, q) {
     const name = q.get('name')
     if (!name) throw Object.assign(new Error('缺少文件名'), { code: 400 })
-    const dir = db.settings.downloadDir || defaultDownloadDir()
-    const full = path.join(dir, name)
-    if (!full.startsWith(dir)) throw Object.assign(new Error('非法路径'), { code: 400 })
-    try { fs.unlinkSync(full) } catch (e) { throw Object.assign(new Error('删除失败：' + e.message), { code: 500 }) }
-    return { ok: true }
+    /* B10: 只允许删音频扩展名，且必须属于扫描目录白名单 */
+    if (!/\.(mp3|flac|m4a|ogg|wav)$/i.test(name)) {
+      throw Object.assign(new Error('只能删除音频文件'), { code: 400 })
+    }
+    if (name.includes('..') || name.includes('/') || name.includes('\\')) {
+      throw Object.assign(new Error('非法文件名'), { code: 400 })
+    }
+    const candidates = [...new Set([
+      db.settings.downloadDir,
+      defaultDownloadDir(),
+      path.join(ROOT, 'downloads'),
+      q.get('dir') || '',
+    ].filter(Boolean))]
+    let removed = ''
+    for (const d of candidates) {
+      const full = path.join(d, name)
+      /* 严格边界：用 path.relative 判断是否逃逸 */
+      const rel = path.relative(d, full)
+      if (rel.startsWith('..') || path.isAbsolute(rel)) continue
+      if (!fs.existsSync(full)) continue
+      try { fs.unlinkSync(full); removed = full } catch (e) { }
+      if (removed) break
+    }
+    if (!removed) throw Object.assign(new Error('文件不存在或删除失败'), { code: 404 })
+    return { ok: true, path: removed }
   },
 
   async '/api/download' (req, q, res) {
@@ -665,7 +711,7 @@ const routes = {
     }
     if (action === 'add') {
       const p = db.playlists.find((x) => x.id === (body.listId || 'default'))
-      if (p && body.song && !p.songs.some((s) => s.id === body.song.id)) { p.songs.push(body.song); saveDb() }
+      if (p && body.song && !p.songs.some((s) => s.id === body.song.id && (s.source || 'wy') === (body.song.source || 'wy'))) { p.songs.push(body.song); saveDb() }
       return { playlists: db.playlists }
     }
     if (action === 'remove') {
@@ -701,7 +747,9 @@ function fetchText (url) {
 function serveStatic (req, res, pathname) {
   let rel = decodeURIComponent(pathname === '/' ? '/index.html' : pathname)
   const full = path.join(PUBLIC, rel.replace(/^\/+/, ''))
-  if (!full.startsWith(PUBLIC)) return json(res, 403, { error: '禁止访问' })
+  /* S4: 用 path.relative 判断，避免 public2/ 这类兄弟前缀绕过 */
+  const __rel = path.relative(PUBLIC, full)
+  if (__rel.startsWith('..') || path.isAbsolute(__rel)) return json(res, 403, { error: '禁止访问' })
   fs.readFile(full, (err, buf) => {
     if (err) {
       res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' })
@@ -735,7 +783,8 @@ const server = http.createServer(async (req, res) => {
   }
 })
 
-server.listen(PORT, '0.0.0.0', () => {
+/* S1: 默认只监听本机；要开局域网请设 PHONOGRAPH_LAN=1 */
+server.listen(PORT, process.env.PHONOGRAPH_LAN === '1' ? '0.0.0.0' : '127.0.0.1', () => {
   const os = require('node:os')
   const ips = []
   for (const list of Object.values(os.networkInterfaces())) {

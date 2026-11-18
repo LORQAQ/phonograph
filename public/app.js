@@ -685,7 +685,16 @@ async function startSong (song, only) {
   $('#lyricInner').innerHTML = '<p class="lyric-empty">歌词加载中…</p>'
   $('#lyricRoll').innerHTML = '<p class="lyric-empty">歌词加载中…</p>'
 
-  audio.src = await streamSrc(song, only)
+  /* B3: 取流是异步的，回来时必须确认没有切到别的歌 */
+  const __srcUrl = await streamSrc(song, only)
+  if (token !== state.playToken) return
+  /* B4: 空值不要赋给 audio.src（否则等于请求当前页面） */
+  if (__srcUrl) {
+    audio.src = __srcUrl
+  } else {
+    audio.removeAttribute('src')
+    setSrc('解析失败')
+  }
   /* 残缺检测：metadata / durationchange / 轮询 */
   let __pcChecked = false
   const __pcCheck = () => {
