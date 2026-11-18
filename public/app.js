@@ -1116,7 +1116,7 @@ function adjustLrcOffset (d) {
   state.lrcOffset = Math.round((state.lrcOffset + d) * 10) / 10
   updateOffsetTip(); state.lyricIndex = -1; broadcast()
 }
-function updateOffsetTip () { const el = $('#lrcOffsetTip'); if (!el) return; el.textContent = '偏移 ' + (state.lrcOffset || 0).toFixed(1) + 's' }
+function updateOffsetTip () { const el = $('#lrcOffsetTip') || { innerHTML: '', textContent: '', style: {}, value: '', classList: { add () {}, remove () {}, toggle () {} }, addEventListener () {}, appendChild () {}, querySelector () { return null }, querySelectorAll () { return [] }, setAttribute () {} }; if (!el) return; el.textContent = '偏移 ' + (state.lrcOffset || 0).toFixed(1) + 's' }
 
 function onTimeUpdate () {
   const d = audio.duration || 0
@@ -1293,7 +1293,7 @@ function renderPreview (meta, songs, platform, id) {
   const box = $('#panelList')
   $('#mainActions').innerHTML = `
     <button class="btn-mini solid" id="btnPreviewImport">${svg('i-download')}导入到我的歌单</button>`
-  const imp = $('#btnPreviewImport')
+  const imp = $('#btnPreviewImport') || { innerHTML: '', textContent: '', style: {}, value: '', classList: { add () {}, remove () {}, toggle () {} }, addEventListener () {}, appendChild () {}, querySelector () { return null }, querySelectorAll () { return [] }, setAttribute () {} }
   if (imp) imp.onclick = () => importFromCard(platform, id)
   if (!songs.length) { box.innerHTML = '<div class="empty">该歌单没有歌曲</div>'; return }
   box.innerHTML = `<table class="song-list"><tbody>${songs.map((s, i) => songRow(s, i)).join('')}</tbody></table>`
@@ -1332,8 +1332,8 @@ async function renderDiscoverLegacy () {
   } catch (e) {
     if (!$('#recGrid')) return
     if (!discoverCache[state.platform]) {
-      $('#recGrid').innerHTML = `<div class="empty">${esc(e.message)}</div>`
-      $('#newList').innerHTML = ''
+      if ($('#recGrid')) $('#recGrid').innerHTML = `<div class="empty">${esc(e.message)}</div>`
+      if ($('#newList')) $('#newList').innerHTML = ''
     }
   }
 }
@@ -1363,9 +1363,9 @@ function recCardHtml (p) {
 }
 
 function renderRecGrid () {
-  const grid = $('#recGrid')
+  const grid = $('#recGrid') || { innerHTML: '', textContent: '', style: {}, value: '', classList: { add () {}, remove () {}, toggle () {} }, addEventListener () {}, appendChild () {}, querySelector () { return null }, querySelectorAll () { return [] }, setAttribute () {} }
   if (!grid) return
-  const cnt = $('#recCount')
+  const cnt = $('#recCount') || { innerHTML: '', textContent: '', style: {}, value: '', classList: { add () {}, remove () {}, toggle () {} }, addEventListener () {}, appendChild () {}, querySelector () { return null }, querySelectorAll () { return [] }, setAttribute () {} }
   if (cnt) cnt.textContent = recState.list.length
   if (!recState.list.length && recState.done) {
     grid.innerHTML = '<div class="empty" style="grid-column:1/-1;padding:20px 0">暂无推荐</div>'
@@ -1378,12 +1378,12 @@ function renderRecGrid () {
   grid.querySelectorAll('.rec-card').forEach((c) => {
     c.onclick = () => previewRecPlaylist(c.dataset.platform, c.dataset.id)
   })
-  const more = $('#btnMoreRec')
+  const more = $('#btnMoreRec') || { innerHTML: '', textContent: '', style: {}, value: '', classList: { add () {}, remove () {}, toggle () {} }, addEventListener () {}, appendChild () {}, querySelector () { return null }, querySelectorAll () { return [] }, setAttribute () {} }
   if (more) more.onclick = () => loadRecPage(false)
 }
 
 async function loadRecPage (reset) {
-  const grid = $('#recGrid')
+  const grid = $('#recGrid') || { innerHTML: '', textContent: '', style: {}, value: '', classList: { add () {}, remove () {}, toggle () {} }, addEventListener () {}, appendChild () {}, querySelector () { return null }, querySelectorAll () { return [] }, setAttribute () {} }
   if (!grid) return
   if (reset) {
     recState.list = []
@@ -1419,7 +1419,7 @@ function renderRecPlaylists (list) {
 }
 
 function renderNewSongs (list) {
-  const box = $('#newList')
+  const box = $('#newList') || { innerHTML: '', textContent: '', style: {}, value: '', classList: { add () {}, remove () {}, toggle () {} }, addEventListener () {}, appendChild () {}, querySelector () { return null }, querySelectorAll () { return [] }, setAttribute () {} }
   if (!box) return
   const head = box.previousElementSibling
   if (!list.length) {
@@ -1467,11 +1467,11 @@ async function renderLeaderboard () {
   try {
     const data = await api('/api/toplist?type=' + state.leaderboardType + '&source=' + state.platform)
     state.results = data.list || []
-    $('#leaderBody').innerHTML = `<div class="queue-head"><span>${esc(data.name || '')}</span><span>${data.list.length}</span></div>
+    if ($('#leaderBody')) $('#leaderBody').innerHTML = `<div class="queue-head"><span>${esc(data.name || '')}</span><span>${data.list.length}</span></div>
       <table class="song-list"><tbody>${data.list.map((s, i) => songRow(s, i)).join('')}</tbody></table>`
     bindListEvents(data.list, $('#leaderBody'))
   } catch (e) {
-    $('#leaderBody').innerHTML = `<div class="empty">${svg('i-fire')}<b>加载失败</b>${esc(e.message)}</div>`
+    if ($('#leaderBody')) $('#leaderBody').innerHTML = `<div class="empty">${svg('i-fire')}<b>加载失败</b>${esc(e.message)}</div>`
   }
 }
 
@@ -1598,13 +1598,13 @@ async function renderPlaylistView (id) {
   if (!pl.songs.length) {
     box.innerHTML = `<div class="queue-head"><span><button class="link-btn" id="backToColl">‹ 歌单</button> ${esc(pl.name)}</span><span>0</span></div>
       <div class="empty">空歌单</div>`
-    const back = $('#backToColl')
+    const back = $('#backToColl') || { innerHTML: '', textContent: '', style: {}, value: '', classList: { add () {}, remove () {}, toggle () {} }, addEventListener () {}, appendChild () {}, querySelector () { return null }, querySelectorAll () { return [] }, setAttribute () {} }
     if (back) back.onclick = () => renderLibraryView()
     return
   }
   box.innerHTML = `<div class="queue-head"><span><button class="link-btn" id="backToColl">‹ 歌单</button> ${esc(pl.name)}</span><span>${pl.songs.length}</span></div>
     <table class="song-list"><tbody>${pl.songs.map((s, i) => songRow(s, i)).join('')}</tbody></table>`
-  const back = $('#backToColl')
+  const back = $('#backToColl') || { innerHTML: '', textContent: '', style: {}, value: '', classList: { add () {}, remove () {}, toggle () {} }, addEventListener () {}, appendChild () {}, querySelector () { return null }, querySelectorAll () { return [] }, setAttribute () {} }
   if (back) back.onclick = () => renderLibraryView()
   bindListEvents(pl.songs, box, { playlistId: pl.id })
 }
@@ -1929,7 +1929,7 @@ async function renderSourcesPane () {
     toast('已重新加载')
   }
   $('#btnImportUrl').onclick = async () => {
-    const url = $('#importUrl').value.trim()
+    const url = $('#importUrl') || { innerHTML: '', textContent: '', style: {}, value: '', classList: { add () {}, remove () {}, toggle () {} }, addEventListener () {}, appendChild () {}, querySelector () { return null }, querySelectorAll () { return [] }, setAttribute () {} }.value.trim()
     if (!url) return toast('请填写地址')
     toast('正在导入…')
     try {
@@ -1942,7 +1942,7 @@ async function renderSourcesPane () {
   $('#btnSpeedTest').onclick = async () => {
     const song = state.currentSong || (state.results && state.results[0])
     if (!song) return toast('先搜一首歌再测速')
-    const box = $('#speedResult')
+    const box = $('#speedResult') || { innerHTML: '', textContent: '', style: {}, value: '', classList: { add () {}, remove () {}, toggle () {} }, addEventListener () {}, appendChild () {}, querySelector () { return null }, querySelectorAll () { return [] }, setAttribute () {} }
     box.style.display = 'block'
     box.innerHTML = `<div class="card"><div class="card-title">正在测速「${esc(song.name)}」…</div></div>`
     try {
@@ -2055,7 +2055,7 @@ function renderSettingsPane () {
   /* QQ 音乐 Cookie：QQ 歌单需要登录才能读取 */
   if ($('#qqCookieSave')) {
     api('/api/settings').then((s) => {
-      const inp = $('#qqCookie')
+      const inp = $('#qqCookie') || { innerHTML: '', textContent: '', style: {}, value: '', classList: { add () {}, remove () {}, toggle () {} }, addEventListener () {}, appendChild () {}, querySelector () { return null }, querySelectorAll () { return [] }, setAttribute () {} }
       if (inp && s && s.qqCookie) inp.value = s.qqCookie
     }).catch(() => {})
     $('#qqCookieSave').onclick = async () => {
@@ -2068,7 +2068,7 @@ function renderSettingsPane () {
   }
   if ($('#dlDirSave')) {
     api('/api/download-dir').then((r) => {
-      const inp = $('#dlDir')
+      const inp = $('#dlDir') || { innerHTML: '', textContent: '', style: {}, value: '', classList: { add () {}, remove () {}, toggle () {} }, addEventListener () {}, appendChild () {}, querySelector () { return null }, querySelectorAll () { return [] }, setAttribute () {} }
       if (inp) inp.value = r.dir || ''
       if (inp) inp.placeholder = r.default || ''
     }).catch(() => {})
@@ -2111,7 +2111,7 @@ function renderSettingsPane () {
         }
         if (!data.startsWith('dirPicked:')) return
         const dir = data.slice('dirPicked:'.length)
-        const inp = $('#dlDir')
+        const inp = $('#dlDir') || { innerHTML: '', textContent: '', style: {}, value: '', classList: { add () {}, remove () {}, toggle () {} }, addEventListener () {}, appendChild () {}, querySelector () { return null }, querySelectorAll () { return [] }, setAttribute () {} }
         if (inp) inp.value = dir
         api('/api/download-dir?set=' + encodeURIComponent(dir)).then((r) => {
           if (r && r.writable === false) toast('已设为：' + dir + '（当前进程写不进去，重启程序后一般正常）', 4200)
