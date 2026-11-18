@@ -522,28 +522,67 @@ function bindEvents () {
 /* ================= 进度 / 音量 ================= */
 function bindProgress () {
   const bar = $('#progress')
+  if (!bar) return
   let dragging = false
+  /* 兼容鼠标、触摸、笔：统一取 clientX */
+  const cx = (e) => {
+    if (e.touches && e.touches.length) return e.touches[0].clientX
+    if (e.changedTouches && e.changedTouches.length) return e.changedTouches[0].clientX
+    return e.clientX
+  }
   const posOf = (e) => {
     const r = bar.getBoundingClientRect()
-    return Math.min(1, Math.max(0, (e.clientX - r.left) / r.width))
+    if (!r.width) return 0
+    return Math.min(1, Math.max(0, (cx(e) - r.left) / r.width))
   }
-  bar.addEventListener('mousedown', (e) => {
+  const start = (e) => {
     if (!audio.duration) return
     dragging = true
     bar.classList.add('dragging')
-    paintProgress(posOf(e))
-    audio.currentTime = posOf(e) * audio.duration
-  })
-  window.addEventListener('mousemove', (e) => {
+    const p = posOf(e)
+    paintProgress(p)
+    audio.currentTime = p * audio.duration
+    if (e.cancelable) e.preventDefault()
+  }
+  const move = (e) => {
     if (!audio.duration) return
     const p = posOf(e)
-    if (bar.contains(e.target) || dragging) {
-      $('#progressFloat').style.left = (p * 100) + '%'
-      $('#progressFloat').textContent = fmtTime(p * audio.duration)
+    const fl = $('#progressFloat')
+    if (fl) {
+      fl.style.left = (p * 100) + '%'
+      fl.textContent = fmtTime(p * audio.duration)
     }
-    if (dragging) { paintProgress(p); audio.currentTime = p * audio.duration }
-  })
-  window.addEventListener('mouseup', () => { dragging = false; bar.classList.remove('dragging') })
+    if (dragging) {
+      paintProgress(p)
+      audio.currentTime = p * audio.duration
+      if (e.cancelable) e.preventDefault()
+    }
+  }
+  const end = () => {
+    if (!dragging) return
+    dragging = false
+    bar.classList.remove('dragging')
+  }
+
+  /* Pointer Events（优先，一套覆盖鼠标+触摸） */
+  if (window.PointerEvent) {
+    bar.addEventListener('pointerdown', (e) => {
+      try { bar.setPointerCapture(e.pointerId) } catch (er) { }
+      start(e)
+    })
+    bar.addEventListener('pointermove', move)
+    bar.addEventListener('pointerup', end)
+    bar.addEventListener('pointercancel', end)
+  } else {
+    /* 老环境退回 mouse + touch */
+    bar.addEventListener('mousedown', start)
+    window.addEventListener('mousemove', move)
+    window.addEventListener('mouseup', end)
+    bar.addEventListener('touchstart', start, { passive: false })
+    bar.addEventListener('touchmove', move, { passive: false })
+    bar.addEventListener('touchend', end)
+    bar.addEventListener('touchcancel', end)
+  }
 }
 function paintProgress (p) {
   $('#progressInner').style.width = (p * 100) + '%'
