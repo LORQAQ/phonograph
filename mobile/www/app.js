@@ -418,12 +418,9 @@ function bindEvents () {
     b.onclick = () => {
       const v = b.dataset.mview
       $$('.mtab').forEach((x) => x.classList.toggle('active', x === b))
-      if (v === 'play' || v === 'now') {
-        /* 「播放」标签：显示唱机面板 */
-        document.body.classList.add('m-deck')
-        state.view = 'play'
-        try { if (state.currentSong) renderNowPlaying(state.currentSong, true) } catch (e) { }
-        try { renderPanelLyric(); scrollPanelLyric() } catch (e) { }
+      if (v === 'now') {
+        if (document.body.classList.contains('m-deck')) document.body.classList.remove('m-deck')
+        else document.body.classList.add('m-deck')
         return
       }
       document.body.classList.remove('m-deck')
@@ -638,24 +635,6 @@ async function __streamSrcInner (song, only) {
 }
 
 
-/* 预取下一首的播放地址（后台进行，不阻塞） */
-let __prefetching = false
-async function prefetchNext () {
-  if (__prefetching) return
-  if (!state.queue || state.queue.length < 2) return
-  const next = state.queue[(state.index + 1) % state.queue.length]
-  if (!next) return
-  const ck = next.source + '|' + next.id + '||' + state.quality + '|' + state.dlFormat
-  if (__urlCache.has(ck)) return
-  __prefetching = true
-  try {
-    const url = await __streamSrcInner(next)
-    if (url) __urlCache.set(ck, { url, exp: Date.now() + URL_TTL })
-  } catch (e) { }
-  __prefetching = false
-}
-
-
 /* 从 "4:16" 解析秒数 */
 function parseDurText (t) {
   if (!t) return 0
@@ -664,18 +643,15 @@ function parseDurText (t) {
   return Number(m[1]) * 60 + Number(m[2])
 }
 
-/* 检测是否拿到试听片段；是的话换平台重取 */
-let __previewCheck = 0
+/* 拿到的是残缺/试听片段时，自动换平台重取 */
 async function checkPreviewAndSwitch (song, gotDuration) {
   const real = parseDurText(song.durationText)
   if (!real || !gotDuration) return false
-  /* 拿到的时长明显短于原曲 → 判定为残缺/试听版 */
   if (real > 90 && gotDuration < real * 0.85) {
-    console.warn('[试听版]', song.name, '原长', real + 's', '实际', Math.round(gotDuration) + 's')
+    console.warn('[残缺版]', song.name, '原长', real + 's', '实际', Math.round(gotDuration) + 's')
     const tried = state.__triedPlat || (state.__triedPlat = new Set())
     state.__switchCount = (state.__switchCount || 0) + 1
     if (state.__switchCount > 3) {
-      console.warn('[试听版] 已切换 3 次仍未拿到完整版，停止尝试')
       toast('这首暂时只有试听版，换一首试试', 2600)
       return false
     }
@@ -683,7 +659,8 @@ async function checkPreviewAndSwitch (song, gotDuration) {
     if (!order.length) { state.__triedPlat = new Set(); return false }
     const next = order[0]
     tried.add(next)
-    toast('这首是试听版，换到 ' + ({ tx: 'QQ音乐', kg: '酷狗', wy: '网易云' }[next]) + ' 重试', 2800)
+    const pname = { tx: 'QQ音乐', kg: '酷狗', wy: '网易云' }[next] || next
+    toast('这首是残缺版，换到 ' + pname + ' 重试', 2600)
     const alt = Object.assign({}, song, { source: next })
     try { startSong(alt, '') } catch (e) { }
     return true
@@ -693,91 +670,77 @@ async function checkPreviewAndSwitch (song, gotDuration) {
 
 async function startSong (song, only) {
   const token = ++state.playToken
-  /* 同一首（按 id 判断，切换平台后 source 会变）首次播放才清空已试记录 */
-  const songKey = String(song.id)
-  if (!state.__lastSongKey || state.__lastSongKey !== songKey) {
-    state.__lastSongKey = songKey
+  const __songKey = String(song.id)
+  if (!state.__lastSongKey || state.__lastSongKey !== __songKey) {
+    state.__lastSongKey = __songKey
     state.__triedPlat = new Set()
     state.__switchCount = 0
   }
-
-  /* ① 立即掐掉上一首，避免新旧音频混在一起 */
-  try {
-    audio.pause()
-    audio.removeAttribute('src')
-    audio.load()
-  } catch (e) { }
-
   state.currentSong = song
-  state.pendingSeek = 0
-
-  /* ② 先把界面切到新歌（瞬时反馈，不等网络） */
   renderNowPlaying(song, true)
-  try { pickThemeFromCover(song) } catch (e) { }
+  pickThemeFromCover(song)
   state.lyrics = []
   state.lyricIndex = -1
   state.lrcOffset = 0
-  try { updateOffsetTip() } catch (e) { }
-  const li = $('#lyricInner')
-  const lr = $('#lyricRoll')
-  if (li) li.innerHTML = '<p class="lyric-empty">歌词加载中…</p>'
-  if (lr) lr.innerHTML = '<p class="lyric-empty">歌词加载中…</p>'
-  setSrc('正在解析…')
+  updateOffsetTip()
+  $('#lyricInner').innerHTML = '<p class="lyric-empty">歌词加载中…</p>'
+  $('#lyricRoll').innerHTML = '<p class="lyric-empty">歌词加载中…</p>'
 
-  /* ③ 取流 + 歌词并行，只等一次往返 */
-  const lyricQ = '/api/lyric?source=' + (song.source || 'wy') + '&id=' + encodeURIComponent(song.id) + '&interval=' + encodeURIComponent(song.durationText || '')
-  const [urlRes, lyricRes] = await Promise.allSettled([
-    streamSrc(song, only),
-    api(lyricQ),
-  ])
-
-  /* ④ 已经切到别的歌了，这轮结果作废 */
+  /* B3: 取流是异步的，回来时必须确认没有切到别的歌 */
+  const __srcUrl = await streamSrc(song, only)
   if (token !== state.playToken) return
-
-  const url = urlRes.status === 'fulfilled' ? urlRes.value : ''
-  if (url) {
-    audio.src = url
-    audio.play().catch(() => { })
-    /* 残缺版检测：metadata / durationchange / 轮询 三重保险 */
-    let __checked = false
-    const __doCheck = () => {
-      if (__checked) return
-      const d = audio.duration
-      if (!d || !isFinite(d) || d <= 0) return
-      __checked = true
-      try { checkPreviewAndSwitch(song, d) } catch (e) { }
-    }
-    audio.addEventListener('loadedmetadata', __doCheck, { once: true })
-    audio.addEventListener('durationchange', __doCheck, { once: true })
-    setTimeout(__doCheck, 1500)
-    setTimeout(__doCheck, 4000)
-    /* 后台预取下一首 */
-    setTimeout(() => { try { prefetchNext() } catch (e) { } }, 3000)
-    /* 来源提示用缓存里的（避免再发一次请求） */
-    const ck = cacheKey(song) + (only || '')
-    const cached = state.urlCache && state.urlCache.get(ck)
-    if (cached) setSrc(cached.provider + ' · ' + cached.quality)
-    else setSrc('已就绪')
+  /* B4: 空值不要赋给 audio.src（否则等于请求当前页面） */
+  if (__srcUrl) {
+    audio.src = __srcUrl
   } else {
+    audio.removeAttribute('src')
     setSrc('解析失败')
-    toast('这首取不到播放地址，换一首试试', 3200)
+  }
+  /* 残缺检测：metadata / durationchange / 轮询 */
+  let __pcChecked = false
+  const __pcCheck = () => {
+    if (__pcChecked) return
+    const d = audio.duration
+    if (!d || !isFinite(d) || d <= 0) return
+    __pcChecked = true
+    try { checkPreviewAndSwitch(song, d) } catch (e) { }
+  }
+  audio.addEventListener('loadedmetadata', __pcCheck, { once: true })
+  audio.addEventListener('durationchange', __pcCheck, { once: true })
+  setTimeout(__pcCheck, 1500)
+  setTimeout(__pcCheck, 4000)
+  audio.play().catch(() => {})
+
+  try {
+    const ck = cacheKey(song) + (only || '')
+    const cached = state.urlCache.get(ck)
+    if (cached && Date.now() - cached.ts < 5 * 60e3) {
+      setSrc(cached.provider + ' · ' + cached.quality)
+    } else {
+      const info = await api('/api/url?' + songParams(song, only).toString())
+      if (token !== state.playToken) return
+      state.urlCache.set(ck, { provider: info.provider, quality: info.quality, ts: Date.now() })
+      setSrc(info.provider + ' · ' + info.quality)
+    }
+  } catch (e) {
+    if (token !== state.playToken) return
+    setSrc('解析失败')
+    const detail = e.attempts && e.attempts.length ? e.attempts.map((a) => `${a.name}(${a.ms}ms)`).join(' → ') : e.message
+    toast('播放地址解析失败：' + detail, 4200)
   }
 
-  /* ⑤ 歌词 */
-  if (lyricRes.status === 'fulfilled' && lyricRes.value) {
-    const ly = lyricRes.value
+  try {
+    const ly = await api('/api/lyric?source=' + (song.source || 'wy') + '&id=' + encodeURIComponent(song.id) + '&interval=' + encodeURIComponent(song.durationText || ''))
+    if (token !== state.playToken) return
     state.lyrics = parseLrc(ly.lyric, ly.tlyric)
-    renderLyric(); renderPanelLyric()
-    try { broadcast() } catch (e) { }
-  } else {
-    if (li) li.innerHTML = '<p class="lyric-empty">暂无歌词</p>'
-    if (lr) lr.innerHTML = '<p class="lyric-empty">暂无歌词</p>'
+    renderLyric(); renderPanelLyric(); broadcast()
+  } catch (e) {
+    $('#lyricInner').innerHTML = '<p class="lyric-empty">暂无歌词</p>'
+    $('#lyricRoll').innerHTML = '<p class="lyric-empty">暂无歌词</p>'
   }
-
-  /* ⑥ 收尾（不 await，避免拖慢） */
-  try { addRecent(song) } catch (e) { }
-  try { renderQueue() } catch (e) { }
-  try { saveQueue() } catch (e) { }
+  addRecent(song)
+  renderQueue()
+  saveQueue()
 }
 
 function renderNowPlaying (song, resetBadge) {
@@ -1090,39 +1053,6 @@ function parseLrc (lrc, tlrc) {
   return [...map.values()].filter((l) => l.text).sort((a, b) => a.t - b.t)
 }
 
-
-/* 歌词页背景：专辑封面 + 高斯感暗化 */
-function paintLyricBg (song) {
-  const bg = document.getElementById('lyricBg')
-  const cover = document.getElementById('lyricCover')
-  const url = song && (song.cover || coverUrl(song))
-  if (cover && url) cover.src = url
-  if (!bg) return
-  if (url) {
-    bg.style.backgroundImage = 'url("' + url + '")'
-    bg.style.opacity = '1'
-  } else {
-    bg.style.backgroundImage = 'none'
-  }
-}
-
-
-/* 把指定歌词行滚动到容器垂直中央 */
-function scrollLyricTo (index) {
-  const box = document.getElementById('lyricScroll')
-  const inner = document.getElementById('lyricInner')
-  if (!box || !inner) return
-  const lines = inner.querySelectorAll('.lyric-line')
-  const el = lines[index]
-  if (!el) return
-  const target = el.offsetTop - box.clientHeight / 2 + el.offsetHeight / 2
-  try {
-    box.scrollTo({ top: Math.max(0, target), behavior: 'smooth' })
-  } catch (e) {
-    box.scrollTop = Math.max(0, target)
-  }
-}
-
 function renderLyric () {
   const box = $('#lyricInner')
   if (!state.lyrics.length) { box.innerHTML = '<p class="lyric-empty">暂无歌词</p>'; return }
@@ -1131,23 +1061,11 @@ function renderLyric () {
     `<p class="lyric-line" data-i="${i}">${esc(l.text)}${l.trans ? '<br/><span style="font-size:.72em;opacity:.6">' + esc(l.trans) + '</span>' : ''}</p>`
   ).join('')
   box.querySelectorAll('.lyric-line').forEach((el) => {
-    el.style.cursor = 'pointer'
     el.onclick = () => {
-      const line = state.lyrics[Number(el.dataset.i)]
-      if (!line) return
-      const t = Math.max(0, line.t - state.lrcOffset)
-      try {
-        /* 不等 duration，直接设；浏览器会自动夹到有效范围 */
-        audio.currentTime = t
-        if (audio.paused) audio.play().catch(() => {})
-        toast('跳到 ' + Math.floor(t / 60) + ':' + String(Math.floor(t % 60)).padStart(2, '0'), 1400)
-      } catch (e) {
-        toast('跳转失败：' + e.message, 2000)
-      }
+      const t = state.lyrics[Number(el.dataset.i)].t - state.lrcOffset
+      if (audio.duration) audio.currentTime = Math.max(0, t)
     }
   })
-  /* 同步滚动位置到当前行 */
-  if (state.lyricIndex >= 0) scrollLyricTo(state.lyricIndex)
   state.lyricIndex = -1
 }
 
@@ -1165,23 +1083,12 @@ function renderPanelLyric () {
   scrollPanelLyric()
 }
 function scrollPanelLyric () {
-  const roll = $('#lyricRoll')
-  if (!roll) return
-  const el = roll.querySelector('.ll.active')
+  const box = $('#lyricRoll')
+  if (!box) return
+  const el = box.querySelector('.ll.active')
   if (!el) return
-
-  /* 移动端真正滚动的是 .deck-body；桌面端是 .lyric-roll 自己 */
-  const scroller = document.querySelector('.m-deck .deck-body') || roll
-  const scRect = scroller.getBoundingClientRect()
-  const elRect = el.getBoundingClientRect()
-  /* 元素相对滚动容器可视区顶部的偏移 */
-  const delta = elRect.top - scRect.top
-  const target = Math.max(0, scroller.scrollTop + delta - scroller.clientHeight / 2 + elRect.height / 2)
-  try {
-    scroller.scrollTo({ top: target, behavior: 'smooth' })
-  } catch (e) {
-    scroller.scrollTop = target
-  }
+  const target = el.offsetTop - box.clientHeight / 2 + el.clientHeight / 2
+  box.scrollTo({ top: Math.max(0, target), behavior: 'smooth' })
 }
 
 function syncLyric (time) {
@@ -1194,24 +1101,10 @@ function syncLyric (time) {
   const lines = $('#lyricInner').querySelectorAll('.lyric-line')
   lines.forEach((el, i) => el.classList.toggle('active', i === idx))
   if (idx >= 0 && lines[idx]) {
-    const sc = $('#lyricScroll')
-    if (sc) {
-      const h = sc.clientHeight / 2
-      const offset = lines[idx].offsetTop + lines[idx].clientHeight / 2
-      const target = Math.max(0, offset - h)
-      try { sc.scrollTo({ top: target, behavior: 'smooth' }) } catch (e) { sc.scrollTop = target }
-    }
+    const h = $('#lyricScroll').clientHeight / 2
+    const offset = lines[idx].offsetTop + lines[idx].clientHeight / 2
+    $('#lyricInner').style.transform = `translateY(${-offset + h}px)`
   }
-  /* 播放页歌词：同步高亮 */
-  try {
-    const roll = $('#lyricRoll')
-    if (roll) {
-      const lls = roll.querySelectorAll('.ll')
-      lls.forEach((el2, i2) => el2.classList.toggle('active', i2 === idx))
-    }
-  } catch (e) { }
-  /* 播放页里的歌词也要跟着滚 */
-  try { scrollPanelLyric() } catch (e) { }
   const roll = $('#lyricRoll').querySelectorAll('.ll')
   roll.forEach((el, i) => el.classList.toggle('active', i === idx))
   scrollPanelLyric()
@@ -1233,7 +1126,7 @@ function adjustLrcOffset (d) {
   state.lrcOffset = Math.round((state.lrcOffset + d) * 10) / 10
   updateOffsetTip(); state.lyricIndex = -1; broadcast()
 }
-function updateOffsetTip () { const el = $('#lrcOffsetTip'); if (!el) return; el.textContent = '偏移 ' + (state.lrcOffset || 0).toFixed(1) + 's' }
+function updateOffsetTip () { const el = $('#lrcOffsetTip') || { innerHTML: '', textContent: '', style: {}, value: '', classList: { add () {}, remove () {}, toggle () {} }, addEventListener () {}, appendChild () {}, querySelector () { return null }, querySelectorAll () { return [] }, setAttribute () {} }; if (!el) return; el.textContent = '偏移 ' + (state.lrcOffset || 0).toFixed(1) + 's' }
 
 function onTimeUpdate () {
   const d = audio.duration || 0
@@ -1410,7 +1303,7 @@ function renderPreview (meta, songs, platform, id) {
   const box = $('#panelList')
   $('#mainActions').innerHTML = `
     <button class="btn-mini solid" id="btnPreviewImport">${svg('i-download')}导入到我的歌单</button>`
-  const imp = $('#btnPreviewImport')
+  const imp = $('#btnPreviewImport') || { innerHTML: '', textContent: '', style: {}, value: '', classList: { add () {}, remove () {}, toggle () {} }, addEventListener () {}, appendChild () {}, querySelector () { return null }, querySelectorAll () { return [] }, setAttribute () {} }
   if (imp) imp.onclick = () => importFromCard(platform, id)
   if (!songs.length) { box.innerHTML = '<div class="empty">该歌单没有歌曲</div>'; return }
   box.innerHTML = `<table class="song-list"><tbody>${songs.map((s, i) => songRow(s, i)).join('')}</tbody></table>`
@@ -1449,8 +1342,8 @@ async function renderDiscoverLegacy () {
   } catch (e) {
     if (!$('#recGrid')) return
     if (!discoverCache[state.platform]) {
-      $('#recGrid').innerHTML = `<div class="empty">${esc(e.message)}</div>`
-      $('#newList').innerHTML = ''
+      if ($('#recGrid')) $('#recGrid').innerHTML = `<div class="empty">${esc(e.message)}</div>`
+      if ($('#newList')) $('#newList').innerHTML = ''
     }
   }
 }
@@ -1480,9 +1373,9 @@ function recCardHtml (p) {
 }
 
 function renderRecGrid () {
-  const grid = $('#recGrid')
+  const grid = $('#recGrid') || { innerHTML: '', textContent: '', style: {}, value: '', classList: { add () {}, remove () {}, toggle () {} }, addEventListener () {}, appendChild () {}, querySelector () { return null }, querySelectorAll () { return [] }, setAttribute () {} }
   if (!grid) return
-  const cnt = $('#recCount')
+  const cnt = $('#recCount') || { innerHTML: '', textContent: '', style: {}, value: '', classList: { add () {}, remove () {}, toggle () {} }, addEventListener () {}, appendChild () {}, querySelector () { return null }, querySelectorAll () { return [] }, setAttribute () {} }
   if (cnt) cnt.textContent = recState.list.length
   if (!recState.list.length && recState.done) {
     grid.innerHTML = '<div class="empty" style="grid-column:1/-1;padding:20px 0">暂无推荐</div>'
@@ -1495,12 +1388,12 @@ function renderRecGrid () {
   grid.querySelectorAll('.rec-card').forEach((c) => {
     c.onclick = () => previewRecPlaylist(c.dataset.platform, c.dataset.id)
   })
-  const more = $('#btnMoreRec')
+  const more = $('#btnMoreRec') || { innerHTML: '', textContent: '', style: {}, value: '', classList: { add () {}, remove () {}, toggle () {} }, addEventListener () {}, appendChild () {}, querySelector () { return null }, querySelectorAll () { return [] }, setAttribute () {} }
   if (more) more.onclick = () => loadRecPage(false)
 }
 
 async function loadRecPage (reset) {
-  const grid = $('#recGrid')
+  const grid = $('#recGrid') || { innerHTML: '', textContent: '', style: {}, value: '', classList: { add () {}, remove () {}, toggle () {} }, addEventListener () {}, appendChild () {}, querySelector () { return null }, querySelectorAll () { return [] }, setAttribute () {} }
   if (!grid) return
   if (reset) {
     recState.list = []
@@ -1536,7 +1429,7 @@ function renderRecPlaylists (list) {
 }
 
 function renderNewSongs (list) {
-  const box = $('#newList')
+  const box = $('#newList') || { innerHTML: '', textContent: '', style: {}, value: '', classList: { add () {}, remove () {}, toggle () {} }, addEventListener () {}, appendChild () {}, querySelector () { return null }, querySelectorAll () { return [] }, setAttribute () {} }
   if (!box) return
   const head = box.previousElementSibling
   if (!list.length) {
@@ -1584,11 +1477,11 @@ async function renderLeaderboard () {
   try {
     const data = await api('/api/toplist?type=' + state.leaderboardType + '&source=' + state.platform)
     state.results = data.list || []
-    $('#leaderBody').innerHTML = `<div class="queue-head"><span>${esc(data.name || '')}</span><span>${data.list.length}</span></div>
+    if ($('#leaderBody')) $('#leaderBody').innerHTML = `<div class="queue-head"><span>${esc(data.name || '')}</span><span>${data.list.length}</span></div>
       <table class="song-list"><tbody>${data.list.map((s, i) => songRow(s, i)).join('')}</tbody></table>`
     bindListEvents(data.list, $('#leaderBody'))
   } catch (e) {
-    $('#leaderBody').innerHTML = `<div class="empty">${svg('i-fire')}<b>加载失败</b>${esc(e.message)}</div>`
+    if ($('#leaderBody')) $('#leaderBody').innerHTML = `<div class="empty">${svg('i-fire')}<b>加载失败</b>${esc(e.message)}</div>`
   }
 }
 
@@ -1715,13 +1608,13 @@ async function renderPlaylistView (id) {
   if (!pl.songs.length) {
     box.innerHTML = `<div class="queue-head"><span><button class="link-btn" id="backToColl">‹ 歌单</button> ${esc(pl.name)}</span><span>0</span></div>
       <div class="empty">空歌单</div>`
-    const back = $('#backToColl')
+    const back = $('#backToColl') || { innerHTML: '', textContent: '', style: {}, value: '', classList: { add () {}, remove () {}, toggle () {} }, addEventListener () {}, appendChild () {}, querySelector () { return null }, querySelectorAll () { return [] }, setAttribute () {} }
     if (back) back.onclick = () => renderLibraryView()
     return
   }
   box.innerHTML = `<div class="queue-head"><span><button class="link-btn" id="backToColl">‹ 歌单</button> ${esc(pl.name)}</span><span>${pl.songs.length}</span></div>
     <table class="song-list"><tbody>${pl.songs.map((s, i) => songRow(s, i)).join('')}</tbody></table>`
-  const back = $('#backToColl')
+  const back = $('#backToColl') || { innerHTML: '', textContent: '', style: {}, value: '', classList: { add () {}, remove () {}, toggle () {} }, addEventListener () {}, appendChild () {}, querySelector () { return null }, querySelectorAll () { return [] }, setAttribute () {} }
   if (back) back.onclick = () => renderLibraryView()
   bindListEvents(pl.songs, box, { playlistId: pl.id })
 }
@@ -2046,7 +1939,7 @@ async function renderSourcesPane () {
     toast('已重新加载')
   }
   $('#btnImportUrl').onclick = async () => {
-    const url = $('#importUrl').value.trim()
+    const url = $('#importUrl') || { innerHTML: '', textContent: '', style: {}, value: '', classList: { add () {}, remove () {}, toggle () {} }, addEventListener () {}, appendChild () {}, querySelector () { return null }, querySelectorAll () { return [] }, setAttribute () {} }.value.trim()
     if (!url) return toast('请填写地址')
     toast('正在导入…')
     try {
@@ -2059,7 +1952,7 @@ async function renderSourcesPane () {
   $('#btnSpeedTest').onclick = async () => {
     const song = state.currentSong || (state.results && state.results[0])
     if (!song) return toast('先搜一首歌再测速')
-    const box = $('#speedResult')
+    const box = $('#speedResult') || { innerHTML: '', textContent: '', style: {}, value: '', classList: { add () {}, remove () {}, toggle () {} }, addEventListener () {}, appendChild () {}, querySelector () { return null }, querySelectorAll () { return [] }, setAttribute () {} }
     box.style.display = 'block'
     box.innerHTML = `<div class="card"><div class="card-title">正在测速「${esc(song.name)}」…</div></div>`
     try {
@@ -2172,7 +2065,7 @@ function renderSettingsPane () {
   /* QQ 音乐 Cookie：QQ 歌单需要登录才能读取 */
   if ($('#qqCookieSave')) {
     api('/api/settings').then((s) => {
-      const inp = $('#qqCookie')
+      const inp = $('#qqCookie') || { innerHTML: '', textContent: '', style: {}, value: '', classList: { add () {}, remove () {}, toggle () {} }, addEventListener () {}, appendChild () {}, querySelector () { return null }, querySelectorAll () { return [] }, setAttribute () {} }
       if (inp && s && s.qqCookie) inp.value = s.qqCookie
     }).catch(() => {})
     $('#qqCookieSave').onclick = async () => {
@@ -2185,7 +2078,7 @@ function renderSettingsPane () {
   }
   if ($('#dlDirSave')) {
     api('/api/download-dir').then((r) => {
-      const inp = $('#dlDir')
+      const inp = $('#dlDir') || { innerHTML: '', textContent: '', style: {}, value: '', classList: { add () {}, remove () {}, toggle () {} }, addEventListener () {}, appendChild () {}, querySelector () { return null }, querySelectorAll () { return [] }, setAttribute () {} }
       if (inp) inp.value = r.dir || ''
       if (inp) inp.placeholder = r.default || ''
     }).catch(() => {})
@@ -2228,7 +2121,7 @@ function renderSettingsPane () {
         }
         if (!data.startsWith('dirPicked:')) return
         const dir = data.slice('dirPicked:'.length)
-        const inp = $('#dlDir')
+        const inp = $('#dlDir') || { innerHTML: '', textContent: '', style: {}, value: '', classList: { add () {}, remove () {}, toggle () {} }, addEventListener () {}, appendChild () {}, querySelector () { return null }, querySelectorAll () { return [] }, setAttribute () {} }
         if (inp) inp.value = dir
         api('/api/download-dir?set=' + encodeURIComponent(dir)).then((r) => {
           if (r && r.writable === false) toast('已设为：' + dir + '（当前进程写不进去，重启程序后一般正常）', 4200)
@@ -2283,8 +2176,6 @@ function switchView (name) {
   if (acts) acts.innerHTML = ''
   $$('.mtab').forEach((x) => x.classList.toggle('active', x.dataset.mview === name))
   document.body.classList.remove('m-deck')
-  /* 切到「播放」标签页时显示唱机面板 */
-  if (name === 'play') document.body.classList.add('m-deck')
   $$('.rail-item').forEach((b) => b.classList.toggle('active', b.dataset.view === name))
   $$('.pl-item').forEach((b) => b.classList.remove('active'))
   const act = {
@@ -2294,10 +2185,6 @@ function switchView (name) {
     recent: () => renderRecentView(),
     leaderboard: () => renderLeaderboard(),
     downloads: () => renderDownloadsView(),
-    play: () => {
-      if (state.currentSong) renderNowPlaying(state.currentSong, true)
-      try { renderPanelLyric() } catch (e) { }
-    },
   }[name]
   act && act()
 }
