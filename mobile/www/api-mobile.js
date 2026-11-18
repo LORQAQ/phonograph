@@ -152,7 +152,7 @@
             singer: (t.singername || parts[0] || '').trim(),
             album: t.remark || '',
             durationText: msToText(Number(t.duration || 0) * 1000),
-            cover: hash ? ('https://imge.kugou.com/stdmusic/240/' + hash.substring(0,2) + '/' + hash + '.jpg') : '',
+            cover: (function (t) { var u = (t && (t.union_cover || t.union_cover_od)) || ''; if (u) return String(u).replace('{size}', '300'); return hash ? ('https://imge.kugou.com/stdmusic/240/' + hash.substring(0, 2) + '/' + hash + '.jpg') : '' })(t.trans_param),
             /* 酷狗取流需要 album_id */
             albumId: t.album_id ? String(t.album_id) : '',
           })
