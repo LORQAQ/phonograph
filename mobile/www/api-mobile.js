@@ -106,30 +106,64 @@
       return { platform, name: cd.dissname || 'QQ歌单', songs, skipped: 0 }
     }
 
-    /* 酷狗 */
-    const kgApi = 'https://wwwapi.kugou.com/yy/special/single/' + id + '.json'
-    const r = await nativeHttp(kgApi, {
-      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/126.0.0.0', Referer: 'https://www.kugou.com/' },
-    })
-    let j = null
-    try { j = JSON.parse(r.body) } catch (e) { }
-    const data = j && (j.data || j)
-    const arr = (data && (data.songs || data.info)) || []
-    const songs = arr.map((t) => {
-      const fn = t.filename || ''
-      const parts = fn.split(' - ')
-      return {
-        id: t.hash || t.album_id,
-        source: 'kg',
-        name: t.songname || (parts[1] || fn),
-        singer: t.singername || (parts[0] || ''),
-        album: t.album_name || '',
-        durationText: msToText((t.duration || 0) * 1000),
-        cover: '',
+    if (platform === 'kg') {
+      /* 酷狗歌单：实测 mobilecdn 的两个接口可用（需要 insecure 跳过证书校验） */
+      const kgHeaders = {
+        'User-Agent': 'Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 Chrome/126.0.0.0 Mobile Safari/537.36',
+        Referer: 'https://m.kugou.com/',
+        Accept: 'application/json, text/plain, */*',
       }
-    }).filter((x) => x.id && x.name)
-    if (!songs.length) throw new Error('酷狗歌单读取失败')
-    return { platform, name: (data && data.specialname) || '酷狗歌单', songs, skipped: 0 }
+
+      let plName = '酷狗歌单'
+      try {
+        const ri = await nativeHttp('https://mobilecdn.kugou.com/api/v3/special/info?specialid=' + id + '&format=json', {
+          headers: kgHeaders,
+          insecure: true,
+        })
+        let ji = null
+        try { ji = JSON.parse(ri.body) } catch (e) { }
+        if (ji && ji.data && ji.data.specialname) plName = ji.data.specialname
+      } catch (e) { }
+
+      let songs = []
+      /* 分页拉，最多 5 页 */
+      for (let page = 1; page <= 5; page++) {
+        let arr = []
+        try {
+          const r = await nativeHttp('https://mobilecdn.kugou.com/api/v3/special/song?specialid=' + id + '&page=' + page + '&pagesize=100&format=json', {
+            headers: kgHeaders,
+            insecure: true,
+          })
+          let j = null
+          try { j = JSON.parse(r.body) } catch (e) { }
+          arr = (j && j.data && j.data.info) || []
+        } catch (e) { break }
+        if (!arr.length) break
+        for (const t of arr) {
+          const fn = String(t.filename || '')
+          const parts = fn.split(' - ')
+          const songName = (t.songname || parts[1] || fn).replace(/\.(mp3|flac|m4a)$/i, '').trim()
+          const hash = String(t.hash || '')
+          if (!hash || !songName) continue
+          songs.push({
+            id: hash,
+            source: 'kg',
+            name: songName,
+            singer: (t.singername || parts[0] || '').trim(),
+            album: t.remark || '',
+            durationText: msToText(Number(t.duration || 0) * 1000),
+            cover: '',
+            /* 酷狗取流需要 album_id */
+            albumId: t.album_id ? String(t.album_id) : '',
+          })
+        }
+        const total = arr.length
+        if (total < 100) break
+      }
+
+      if (!songs.length) throw new Error('酷狗歌单读取失败（可能不是公开歌单）')
+      return { platform, name: plName, songs, skipped: 0 }
+    }
   }
 
   function msToText (ms) {
