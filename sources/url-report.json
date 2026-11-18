@@ -1,0 +1,38 @@
+[
+  {
+    "file": "kulao.js",
+    "name": "👖裤佬SVIP音源",
+    "url": "http://175.27.166.236/wy/wy.php?type=mp3&id=5257138&level=exhigh",
+    "ok": false,
+    "code": 404,
+    "type": "text/html",
+    "len": 138
+  },
+  {
+    "file": "nianxin.js",
+    "name": "念心音源",
+    "url": "http://mcp.nianxinxz.com/share/ceshi/wy.php?id=5257138&level=exhigh&type=mp3",
+    "ok": true,
+    "code": 301,
+    "type": "text/html",
+    "len": 162
+  },
+  {
+    "file": "quandouyao.js",
+    "name": "全豆要[聚合音源]",
+    "url": "http://175.27.166.236/wy/wy.php?type=mp3&id=5257138&level=exhigh",
+    "ok": false,
+    "code": 404,
+    "type": "text/html",
+    "len": 138
+  },
+  {
+    "file": "yiyin.js",
+    "name": "忆音音源",
+    "url": "https://music.3e0.cn/?server=netease&type=url&id=5257138",
+    "ok": true,
+    "code": 200,
+    "type": "text/html; charset=utf-8",
+    "len": 2714
+  }
+]

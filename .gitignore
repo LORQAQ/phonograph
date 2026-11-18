@@ -1,0 +1,36 @@
+# 依赖与运行时（体积大，建议走 Release 附件）
+runtime/node.exe
+runtime/bin/ffmpeg.exe
+runtime/webview2/
+
+# 构建产物
+build/payload/
+build/payload.zip
+build/*.log
+apk-build/app/assets/www/
+apk-build/*.apk
+apk-build/tools/
+
+# 数据与缓存
+data/
+downloads/
+*.db.json
+*.log
+
+# 安装包（走 Release）
+留声-*.exe
+留声*.apk
+*.zip
+
+# 系统与编辑器
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+.idea/
+
+# 临时文件
+*.bak
+*.tmp
+*.full.bak
+extracted-payload.zip

@@ -1,0 +1,308 @@
+'use strict'
+/*
+ * 自定义音源管理：加载 / 排序 / 回退取流
+ * 目录：<root>/sources/*.js （LX Music 兼容脚本，UTF-8）
+ */
+const fs = require('node:fs')
+const path = require('node:path')
+const { LxScript, request } = require('./lx-engine.js')
+
+const QUALITY_ORDER = ['flac24bit', 'flac', '320k', '192k', '128k']
+
+/* 单个音源最多等 5 秒，防止某个源网络挂住拖垮整首 */
+function callWithTimeout (fn, ms = 5000) {
+  return Promise.race([
+    Promise.resolve().then(fn),
+    new Promise((_, rej) => setTimeout(() => rej(new Error('音源超时')), ms)),
+  ])
+}
+
+/**
+ * 播放地址探活：宁可放行，不误杀。
+ * 只淘汰「明确 4xx/5xx」和「明确返回 HTML 错误页」的地址；
+ * Content-Type 缺失、HEAD 不支持、403 防盗链（浏览器带 Referer 可播）一律放行。
+ */
+function probeUrl (url, timeout = 8000) {
+  return new Promise((resolve) => {
+    let settled = false
+    const done = (v) => { if (!settled) { settled = true; clearTimeout(timer); resolve(v) } }
+    const timer = setTimeout(() => done(false), timeout)
+    try {
+      const u = new URL(url)
+      const lib = u.protocol === 'https:' ? require('node:https') : require('node:http')
+      /* 和播放器一样用普通 GET，只看前 64 字节，立刻断开 */
+      const req = lib.get(u, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/126.0.0.0', Accept: '*/*' },
+        timeout: Math.max(3000, timeout - 1500),
+      }, (res) => {
+        if (res.statusCode >= 400 && res.statusCode !== 206) { res.resume(); return done(false) }
+        let judged = false
+        res.on('data', (chunk) => {
+          if (judged) return
+          judged = true
+          const head = chunk.slice(0, 64).toString('latin1').trim()
+          try { res.destroy() } catch (e) { }
+          if (!head) return done(false)
+          if (/^[{[]/.test(head)) return done(false)
+          if (/^<(!doctype|html|\?xml)/i.test(head)) return done(false)
+          done(true)
+        })
+        res.on('end', () => { if (!judged) done(false) })
+        res.on('error', () => { if (!judged) done(false) })
+      })
+      req.on('error', () => done(false))
+      req.on('timeout', () => { try { req.destroy() } catch (e) { } done(false) })
+    } catch (e) { done(false) }
+  })
+}
+
+// 默认优先级（文件名不含 .js）；未列出的排在后面
+const DEFAULT_ORDER = [
+  'fish', 'sixyin', 'nianxin', 'kulao', 'quandouyao', 'yiyin',
+  'lxv7', 'lx', 'huibq', 'ikun', 'flower', 'grass', 'changqing', 'juhe',
+]
+
+class SourceManager {
+  constructor (dir, config) {
+    this.dir = dir
+    this.config = config || {}
+    this.entries = new Map()
+    this.stats = new Map() // "源|平台" -> { ok, fail, avgMs, lastFail } // id -> { id, file, meta, script, status, sources, error, qualitys }
+    this.loading = false
+  }
+
+  list () {
+    return [...this.entries.values()].map((e) => ({
+      id: e.id,
+      name: e.meta.name,
+      version: e.meta.version,
+      author: e.meta.author,
+      description: e.meta.description,
+      file: e.file,
+      status: e.status,
+      error: e.error,
+      enabled: e.enabled,
+      sources: Object.keys(e.sources || {}),
+      qualitys: e.qualitys || {},
+      priority: this.priorityOf(e.id),
+      logs: (e.script && e.script.logs || []).slice(-30),
+    })).sort((a, b) => a.priority - b.priority)
+  }
+
+  priorityOf (id) {
+    const order = (this.config.sourceOrder && this.config.sourceOrder.length) ? this.config.sourceOrder : DEFAULT_ORDER
+    const i = order.indexOf(id)
+    return i === -1 ? 999 : i
+  }
+
+  enabledOf (id) {
+    if (!this.config.disabledSources) return true
+    return !this.config.disabledSources.includes(id)
+  }
+
+  async loadAll () {
+    if (this.loading) return
+    this.loading = true
+    try {
+      if (!fs.existsSync(this.dir)) fs.mkdirSync(this.dir, { recursive: true })
+      const files = fs.readdirSync(this.dir).filter((f) => /\.js$/i.test(f) && !f.startsWith('.'))
+      const tasks = []
+      for (const f of files) tasks.push(this.loadOne(f))
+      // 并发加载，最多 4 个
+      const queue = tasks.slice()
+      const worker = async () => { while (queue.length) { await queue.shift() } }
+      await Promise.all([worker(), worker(), worker(), worker()])
+    } finally {
+      this.loading = false
+    }
+  }
+
+  async loadOne (file) {
+    const id = file.replace(/\.js$/i, '')
+    const full = path.join(this.dir, file)
+    let code = ''
+    try { code = fs.readFileSync(full, 'utf8') } catch (e) { return }
+    const old = this.entries.get(id)
+    if (old && old.script) old.script.dispose()
+    const entry = {
+      id, file, meta: { name: id }, script: null, status: 'loading', sources: {}, error: '',
+      enabled: this.enabledOf(id), qualitys: {},
+    }
+    this.entries.set(id, entry)
+    const script = new LxScript(code, file)
+    entry.meta = script.meta
+    entry.script = script
+    try {
+      const info = await script.init(12000)
+      entry.sources = info.sources || {}
+      entry.qualitys = Object.fromEntries(Object.entries(entry.sources).map(([k, v]) => [k, (v.qualitys || []).join('/')]))
+      entry.status = 'ok'
+    } catch (e) {
+      entry.status = 'error'
+      entry.error = e.message
+    }
+    return entry
+  }
+
+  async reload (id) {
+    const e = this.entries.get(id)
+    if (!e) throw new Error('音源不存在')
+    await this.loadOne(e.file)
+    return this.list().find((x) => x.id === id)
+  }
+
+  remove (id) {
+    const e = this.entries.get(id)
+    if (!e) throw new Error('音源不存在')
+    try { fs.unlinkSync(path.join(this.dir, e.file)) } catch (err) {}
+    if (e.script) e.script.dispose()
+    this.entries.delete(id)
+  }
+
+  /* 安装脚本：源码文本 + 名称 */
+  install (name, code) {
+    const safe = String(name || 'custom').replace(/[^\w\u4e00-\u9fa5.-]/g, '_').slice(0, 40)
+    const file = safe.endsWith('.js') ? safe : safe + '.js'
+    fs.writeFileSync(path.join(this.dir, file), code, 'utf8')
+    return file
+  }
+
+  /* 所有可用（脚本可用且启用）且支持该平台的源，按优先级 */
+  /** 记录一次取流结果，用于后续排序 */
+  recordResult (sourceId, platform, ok, ms) {
+    const k = sourceId + '|' + platform
+    let st = this.stats.get(k)
+    if (!st) { st = { ok: 0, fail: 0, avgMs: 0, lastFail: 0 }; this.stats.set(k, st) }
+    if (ok) {
+      st.ok++
+      st.avgMs = st.avgMs ? Math.round(st.avgMs * 0.7 + (ms || 0) * 0.3) : (ms || 0)
+    } else {
+      st.fail++
+      st.lastFail = Date.now()
+    }
+  }
+
+  /** 打分：成功率为主，速度加分，近期失败扣分 */
+  scoreOf (sourceId, platform) {
+    const st = this.stats.get(sourceId + '|' + platform)
+    if (!st || (st.ok + st.fail) < 2) return 50
+    const total = st.ok + st.fail
+    const rate = st.ok / total
+    const speed = st.avgMs > 0 ? Math.max(-15, 12 - st.avgMs / 800) : 0
+    const recentFail = (st.lastFail && (Date.now() - st.lastFail < 600000)) ? -35 : 0
+    return rate * 100 + speed + recentFail
+  }
+
+  candidates (platform) {
+    const list = this.list()
+      .filter((x) => x.status === 'ok' && x.enabled && x.sources.includes(platform))
+      .sort((a, b) => a.priority - b.priority)
+    /* 酷狗：念心/长青这类中转对 kg 基本失效（返回 404/503），把 verified 的源排前面 */
+    const KG_ORDER = ['dujia6', 'kxh', 'xingkong', 'yuxi', 'changqing2', 'fish', 'freelisten']
+    const initialBias = (id) => {
+      const i = KG_ORDER.indexOf(id)
+      return platform === 'kg' ? (i < 0 ? 9 : i) * -0.5 : 0
+    }
+    list.sort((a, b) => {
+      const sa = this.scoreOf(a.id, platform) + initialBias(a.id)
+      const sb = this.scoreOf(b.id, platform) + initialBias(b.id)
+      return sb - sa
+    })
+    return list
+  }
+
+  bestQuality (platform, wanted) {
+    const cands = this.candidates(platform)
+    for (const c of cands) {
+      const qs = (c.qualitys[platform] || '').split('/').filter(Boolean)
+      if (!qs.length) continue
+      if (wanted && qs.includes(wanted)) return wanted
+      for (const q of QUALITY_ORDER) if (qs.includes(q)) return q
+    }
+    return wanted || '320k'
+  }
+
+  /* 依次尝试各源取播放地址；only 指定时只尝试该源 */
+  async resolveUrl (platform, musicInfo, wantedQuality, only) {
+    let cands = this.candidates(platform)
+    if (only) cands = cands.filter((c) => c.id === only)
+    if (!cands.length) throw new Error(only ? ('指定音源不可用：' + only) : ('没有可用的音源脚本支持 ' + platform))
+
+    const attempts = []
+    const QUALITY_ORDER = ['flac24bit', 'flac', '320k', '192k', '128k']
+
+    /* 每个源只试"首选 + 降级一档"，并行发起，谁先成功用谁 */
+    const task = (c) => async () => {
+      const entry = this.entries.get(c.id)
+      if (!entry || !entry.script) throw new Error('脚本未就绪')
+      const qs = (entry.qualitys[platform] || '').split('/').filter(Boolean)
+      const tries = []
+      if (wantedQuality && qs.includes(wantedQuality)) tries.push(wantedQuality)
+      for (const q of QUALITY_ORDER) if (qs.includes(q) && !tries.includes(q)) tries.push(q)
+      if (!tries.length) tries.push(wantedQuality || '320k')
+      for (const q of tries.slice(0, 2)) {
+        const t0 = Date.now()
+        try {
+          const url = await callWithTimeout(() => entry.script.musicUrl(platform, musicInfo, q), 5000)
+          const ms = Date.now() - t0
+          if (typeof url === 'string' && /^https?:\/\//.test(url)) {
+            /* 拿到的地址先验一次，404 之类直接换源，别把坏地址交给播放器 */
+            const alive = await probeUrl(url, 6000)
+            if (alive) {
+              this.recordResult(c.id, platform, true, ms)
+              attempts.push({ id: c.id, name: entry.meta.name, quality: q, ok: true, ms })
+              return { url, quality: q, provider: entry.meta.name, sourceId: c.id, attempts }
+            }
+            this.recordResult(c.id, platform, false, ms)
+            attempts.push({ id: c.id, name: entry.meta.name, quality: q, ok: false, ms, error: '地址不可用' })
+          } else {
+            attempts.push({ id: c.id, name: entry.meta.name, quality: q, ok: false, ms, error: '返回空地址' })
+          }
+        } catch (e) {
+          this.recordResult(c.id, platform, false, Date.now() - t0)
+          attempts.push({ id: c.id, name: entry.meta.name, quality: q, ok: false, ms: Date.now() - t0, error: (e && e.message) || '错误' })
+        }
+      }
+      throw new Error('no url')
+    }
+
+    const winner = await new Promise((resolve) => {
+      let settled = false
+      let pending = cands.length
+      const timer = setTimeout(() => { if (!settled) { settled = true; resolve(null) } }, 9000)
+      cands.forEach((c) => {
+        task(c)().then((v) => {
+          if (settled) return
+          settled = true
+          clearTimeout(timer)
+          resolve(v)
+        }).catch(() => {
+          if (--pending === 0 && !settled) { settled = true; clearTimeout(timer); resolve(null) }
+        })
+      })
+    })
+
+    if (winner) return winner
+    const last = attempts.filter((a) => !a.ok).slice(-1)[0]
+    throw new Error('所有音源均失败' + (last ? '（最后错误：' + last.name + ': ' + last.error + '）' : ''))
+  }
+
+  async testAll (platform, musicInfo, quality = '320k') {
+    const cands = this.candidates(platform)
+    const results = []
+    await Promise.all(cands.map(async (c) => {
+      const entry = this.entries.get(c.id)
+      const t0 = Date.now()
+      try {
+        const url = await entry.script.musicUrl(platform, musicInfo, quality)
+        const ok = typeof url === 'string' && /^https?:\/\//.test(url)
+        results.push({ id: c.id, name: entry.meta.name, ok, ms: Date.now() - t0, url: ok ? url : '', error: ok ? '' : '返回空地址' })
+      } catch (e) {
+        results.push({ id: c.id, name: entry.meta.name, ok: false, ms: Date.now() - t0, url: '', error: e.message })
+      }
+    }))
+    return results.sort((a, b) => (b.ok - a.ok) || (a.ms - b.ms))
+  }
+}
+
+module.exports = { SourceManager, QUALITY_ORDER }
