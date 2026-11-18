@@ -152,7 +152,7 @@
             singer: (t.singername || parts[0] || '').trim(),
             album: t.remark || '',
             durationText: msToText(Number(t.duration || 0) * 1000),
-            cover: '',
+            cover: hash ? ('https://imge.kugou.com/stdmusic/240/' + hash.substring(0,2) + '/' + hash + '.jpg') : '',
             /* 酷狗取流需要 album_id */
             albumId: t.album_id ? String(t.album_id) : '',
           })
@@ -162,6 +162,29 @@
       }
 
       if (!songs.length) throw new Error('酷狗歌单读取失败（可能不是公开歌单）')
+
+      /* 酷狗接口不返回封面字段，用网易云搜同款补（只补前 30 首，避免太慢） */
+      try {
+        const need = songs.slice(0, 30).filter((x) => !x.cover)
+        await Promise.all(need.map(async (x) => {
+          try {
+            const kw = encodeURIComponent((x.name + ' ' + x.singer).trim())
+            const r = await nativeHttp('https://music.163.com/api/search/get?s=' + kw + '&type=1&limit=1', {
+              headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/126.0.0.0',
+                Referer: 'https://music.163.com/',
+              },
+            })
+            const j = JSON.parse(r.body)
+            const hit = j && j.result && j.result.songs && j.result.songs[0]
+            if (hit && hit.album && hit.album.picId) {
+              const pid = String(hit.album.picId)
+              x.cover = 'https://p' + (Number(pid.slice(-1)) % 4 + 1) + '.music.126.net/' + pid + '.jpg'
+            }
+          } catch (e) { }
+        }))
+      } catch (e) { }
+
       return { platform, name: plName, songs, skipped: 0 }
     }
   }
