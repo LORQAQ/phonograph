@@ -34,3 +34,6 @@ desktop.ini
 *.tmp
 *.full.bak
 extracted-payload.zip
+
+build/
+build

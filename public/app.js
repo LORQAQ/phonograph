@@ -633,8 +633,48 @@ async function __streamSrcInner (song, only) {
   }
 }
 
+
+/* 从 "4:16" 解析秒数 */
+function parseDurText (t) {
+  if (!t) return 0
+  const m = String(t).match(/(\d+):(\d+)/)
+  if (!m) return 0
+  return Number(m[1]) * 60 + Number(m[2])
+}
+
+/* 拿到的是残缺/试听片段时，自动换平台重取 */
+async function checkPreviewAndSwitch (song, gotDuration) {
+  const real = parseDurText(song.durationText)
+  if (!real || !gotDuration) return false
+  if (real > 90 && gotDuration < real * 0.85) {
+    console.warn('[残缺版]', song.name, '原长', real + 's', '实际', Math.round(gotDuration) + 's')
+    const tried = state.__triedPlat || (state.__triedPlat = new Set())
+    state.__switchCount = (state.__switchCount || 0) + 1
+    if (state.__switchCount > 3) {
+      toast('这首暂时只有试听版，换一首试试', 2600)
+      return false
+    }
+    const order = ['kg', 'tx', 'wy'].filter((x) => x !== song.source && !tried.has(x))
+    if (!order.length) { state.__triedPlat = new Set(); return false }
+    const next = order[0]
+    tried.add(next)
+    const pname = { tx: 'QQ音乐', kg: '酷狗', wy: '网易云' }[next] || next
+    toast('这首是残缺版，换到 ' + pname + ' 重试', 2600)
+    const alt = Object.assign({}, song, { source: next })
+    try { startSong(alt, '') } catch (e) { }
+    return true
+  }
+  return false
+}
+
 async function startSong (song, only) {
   const token = ++state.playToken
+  const __songKey = String(song.id)
+  if (!state.__lastSongKey || state.__lastSongKey !== __songKey) {
+    state.__lastSongKey = __songKey
+    state.__triedPlat = new Set()
+    state.__switchCount = 0
+  }
   state.currentSong = song
   renderNowPlaying(song, true)
   pickThemeFromCover(song)
@@ -646,6 +686,19 @@ async function startSong (song, only) {
   $('#lyricRoll').innerHTML = '<p class="lyric-empty">歌词加载中…</p>'
 
   audio.src = await streamSrc(song, only)
+  /* 残缺检测：metadata / durationchange / 轮询 */
+  let __pcChecked = false
+  const __pcCheck = () => {
+    if (__pcChecked) return
+    const d = audio.duration
+    if (!d || !isFinite(d) || d <= 0) return
+    __pcChecked = true
+    try { checkPreviewAndSwitch(song, d) } catch (e) { }
+  }
+  audio.addEventListener('loadedmetadata', __pcCheck, { once: true })
+  audio.addEventListener('durationchange', __pcCheck, { once: true })
+  setTimeout(__pcCheck, 1500)
+  setTimeout(__pcCheck, 4000)
   audio.play().catch(() => {})
 
   try {

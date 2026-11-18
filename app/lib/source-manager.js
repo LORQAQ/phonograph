@@ -23,6 +23,9 @@ function callWithTimeout (fn, ms = 5000) {
  * Content-Type 缺失、HEAD 不支持、403 防盗链（浏览器带 Referer 可播）一律放行。
  */
 function probeUrl (url, timeout = 8000) {
+  /* 网易云外链是 302 占位，播放必失败 */
+  if (/music\.163\.com\/song\/media\/outer/i.test(String(url || ''))) return false
+
   return new Promise((resolve) => {
     let settled = false
     const done = (v) => { if (!settled) { settled = true; clearTimeout(timer); resolve(v) } }

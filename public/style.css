@@ -961,3 +961,22 @@ button:focus,select:focus,a:focus{outline:none}
   }
   .clear-btn { flex-shrink: 0; }
 }
+
+/* ==== 歌词高亮放大 ==== */
+.lyric-line {
+  transition: color .25s ease, font-size .25s ease, transform .25s ease, opacity .25s ease;
+  transform-origin: left center;
+}
+.lyric-line.active {
+  color: #fff !important;
+  font-size: 1.26em !important;
+  font-weight: 700 !important;
+  transform: scale(1.03);
+  text-shadow: 0 2px 18px rgba(0,0,0,.6);
+}
+.lyric-line:not(.active) { opacity: .58; }
+.lyric-line:hover { opacity: .95; }
+
+/* 播放页（deck）歌词 */
+.ll { transition: color .2s, opacity .2s, font-size .2s; cursor: pointer; }
+.ll.active { color: var(--accent, #1f9d55); opacity: 1; font-weight: 700; font-size: 1.12em; }
