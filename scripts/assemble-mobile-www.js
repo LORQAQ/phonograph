@@ -44,21 +44,47 @@ html = html.replace(/<script>\s*if \('serviceWorker'[\s\S]*?<\/script>/, '')
 fs.writeFileSync(path.join(WWW, 'index.html'), html, 'utf8')
 
 // 3) app.js 里移动端特判：禁止再用绝对 /api/ 图片路径（file:// 下会失败）
+//
+// B26: 补丁必须命中。失配说明 public/app.js 的结构变了，必须同步更新本脚本，
+//      否则会静默 no-op，改了半天发现跑的是旧逻辑（已经踩过两次）。
+function mustReplace (src, from, to, name) {
+  if (!src.includes(from)) {
+    throw new Error(
+      '补丁锚点丢失（public/app.js 已改动，请更新 scripts/assemble-mobile-www.js）：' + name +
+      '\n  期望找到：' + JSON.stringify(String(from).slice(0, 90))
+    )
+  }
+  return src.replace(from, to)
+}
+
 let app = fs.readFileSync(path.join(WWW, 'app.js'), 'utf8')
-app = app.replace(
+
+// 3.1 封面 URL 在手机端不再走 /api/pic 绝对路径
+app = mustReplace(
+  app,
   "return '/api/pic?source=' + (song.source || 'wy') + '&id=' + encodeURIComponent(song.id)",
-  "return window.__MOBILE__ ? '' : '/api/pic?source=' + (song.source || 'wy') + '&id=' + encodeURIComponent(song.id)"
+  "return window.__MOBILE__ ? '' : '/api/pic?source=' + (song.source || 'wy') + '&id=' + encodeURIComponent(song.id)",
+  '封面 /api/pic 绝对路径'
 )
-// 跟随封面取色：手机端跳过（file:// 下无法访问 /api/pic）
-app = app.replace(
+
+// 3.2 跟随封面取色在手机端跳过（file:// 下无法访问 /api/pic）
+app = mustReplace(
+  app,
   "img.src = '/api/pic?' + q",
-  "if (window.__MOBILE__) return\n  img.src = '/api/pic?' + q"
+  "if (window.__MOBILE__) return\n  img.src = '/api/pic?' + q",
+  '封面取色跳过'
 )
-// 重载当前曲目：手机端走直链解析
-app = app.replace(
-  "function reloadCurrent () {\n  if (!state.currentSong) return\n  const t = audio.currentTime\n  audio.src = '/api/stream?' + songParams(state.currentSong).toString()",
-  "async function reloadCurrent () {\n  if (!state.currentSong) return\n  const t = audio.currentTime\n  audio.src = await streamSrc(state.currentSong)"
-)
+
+// 3.3 reloadCurrent 的移动端特判已经不需要了：
+//     public/app.js 里的 reloadCurrent 现在本身就是 `async` + `await streamSrc(...)`，
+//     两端共用同一份实现。这里保留一条断言，确保它没被改回同步 + /api/stream 的老写法。
+if (!/async function reloadCurrent \(\)/.test(app)) {
+  throw new Error('reloadCurrent 不再是 async（手机端会走 /api/stream 绝对路径而失败）')
+}
+if (!/await streamSrc\(state\.currentSong\)/.test(app)) {
+  throw new Error('reloadCurrent 里没有 await streamSrc(state.currentSong)（手机端音质切换会失败）')
+}
+
 fs.writeFileSync(path.join(WWW, 'app.js'), app, 'utf8')
 
 const list = fs.readdirSync(WWW, { recursive: true }).filter((f) => fs.statSync(path.join(WWW, f)).isFile())

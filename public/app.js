@@ -131,6 +131,8 @@ function navGo (delta) {
 function enhanceSelect (sel) {
   if (!sel || sel.dataset.dd === '1') return
   sel.dataset.dd = '1'
+  /* B69: 给包装器打标记，好让 CSS 能按 select 的 id 隐藏 */
+  try { wrap.dataset.forSel = sel.id || '' } catch (e) { }
   const wrap = document.createElement('div')
   wrap.className = 'dd'
   sel.parentNode.insertBefore(wrap, sel)
@@ -457,11 +459,24 @@ function bindEvents () {
     if (!b) return
     b.querySelector('use').setAttribute('href', audio.paused ? '#i-play' : '#i-pause')
   }
-  setInterval(syncLyricPlayBtn, 400)
+  /* B70: 改事件驱动，别再每 400ms 轮询 DOM */
+audio.addEventListener('play', syncLyricPlayBtn)
+audio.addEventListener('pause', syncLyricPlayBtn)
+audio.addEventListener('loadedmetadata', syncLyricPlayBtn)
   $('#btnQueueClear').onclick = () => {
     state.queue = []; state.index = -1
     audio.pause(); audio.removeAttribute('src')
-    renderQueue(); saveQueue()
+    /* B87: 清空后底栏不能留残影 */
+      ++state.playToken
+      state.currentSong = null
+      state.lyrics = []
+      state.lyricIndex = -1
+      state.failCount = 0
+      state.__triedPlat = null
+      state.__switchCount = 0
+      try { renderNowPlaying(null, true) } catch (e) { }
+      try { paintProgress(0); $('#totalTime').textContent = '00:00' } catch (e) { }
+      renderQueue(); saveQueue()
     toast('队列已清空')
   }
   $('#btnOpenSources').onclick = () => { $('#overlaySources').classList.add('show'); renderSourcesPane() }
@@ -602,7 +617,10 @@ function bindVolumeKnob () {
 function setVolume (v, silent) {
   state.volume = v
   audio.volume = v
-  audio.muted = false
+  /* B61: state.muted 与 audio.muted 必须同步，否则静音按钮语义会反转 */
+    const __silenced = Number(v) === 0
+    audio.muted = __silenced
+    state.muted = __silenced
   const fill = $('#volumeInner')
   if (fill) fill.style.width = (v * 100) + '%'
   const num = $('#volNum') || { textContent: '', style: {}, classList: { add () {}, remove () {}, toggle () {} }, value: '', addEventListener () {} }
@@ -652,10 +670,10 @@ function setSrc (text) {
 const __urlCache = new Map()
 const URL_TTL = 5 * 60 * 1000
 
-async function streamSrc (song, only) {
+async function streamSrc (song, only, forceFresh) {
   const ck = song.source + '|' + song.id + '|' + (only || '') + '|' + state.quality + '|' + state.dlFormat
   const hit = __urlCache.get(ck)
-  if (hit && hit.exp > Date.now()) return hit.url
+  if (!forceFresh && hit && hit.exp > Date.now()) return hit.url
   const url = await __streamSrcInner(song, only)
   if (url) __urlCache.set(ck, { url, exp: Date.now() + URL_TTL })
   return url
@@ -666,7 +684,17 @@ async function __streamSrcInner (song, only) {
   if (!window.__MOBILE__) return '/api/stream?' + qs
   try {
     const d = await api('/api/url?' + qs)
-    return (d && d.url) || ''
+    const u = (d && d.url) || ''
+    if (!u) return ''
+    /* 移动端复刻电脑端 /api/stream：走本地 HTTP 代理
+       （Java LocalProxy 补 Referer/UA + 完整 Range + 同源免 CORS） */
+    try {
+      if (window.NAPI && typeof window.NAPI.proxyUrl === 'function') {
+        const p = window.NAPI.proxyUrl(u, '')
+        if (p && p.length > 8) return p
+      }
+    } catch (e) { }
+    return u
   } catch (e) {
     return ''
   }
@@ -727,26 +755,44 @@ async function startSong (song, only) {
   /* B3: 取流是异步的，回来时必须确认没有切到别的歌 */
   const __srcUrl = await streamSrc(song, only)
   if (token !== state.playToken) return
-  /* B4: 空值不要赋给 audio.src（否则等于请求当前页面） */
-  if (__srcUrl) {
-    audio.src = __srcUrl
-  } else {
+  /* B4/B52: 空值不要赋给 audio.src，并且必须给用户可见反馈 + 自动跳过 */
+  if (!__srcUrl) {
     audio.removeAttribute('src')
     setSrc('解析失败')
+    state.failCount = (state.failCount || 0) + 1
+    if (state.failCount >= 3) {
+      toast('连续 3 首没取到地址，可能是网络或音源问题，稍后再试', 3600)
+      state.failCount = 0
+      return
+    }
+    toast('这首歌没取到播放地址，自动跳过', 2600)
+    setTimeout(() => { if (token === state.playToken) playNext(true) }, 700)
+    return
   }
-  /* 残缺检测：metadata / durationchange / 轮询 */
+  audio.src = __srcUrl
+
+  /* B53: 上一首的探测器必须回收，否则旧闭包读到新歌的 duration 会把播放抢回去 */
+  if (state.__pcCleanup) { try { state.__pcCleanup() } catch (e) { } state.__pcCleanup = null }
   let __pcChecked = false
+  let __pcT1 = null
+  let __pcT2 = null
   const __pcCheck = () => {
-    if (__pcChecked) return
+    if (__pcChecked || token !== state.playToken) return
     const d = audio.duration
     if (!d || !isFinite(d) || d <= 0) return
     __pcChecked = true
     try { checkPreviewAndSwitch(song, d) } catch (e) { }
   }
-  audio.addEventListener('loadedmetadata', __pcCheck, { once: true })
-  audio.addEventListener('durationchange', __pcCheck, { once: true })
-  setTimeout(__pcCheck, 1500)
-  setTimeout(__pcCheck, 4000)
+  audio.addEventListener('loadedmetadata', __pcCheck)
+  audio.addEventListener('durationchange', __pcCheck)
+  __pcT1 = setTimeout(__pcCheck, 1500)
+  __pcT2 = setTimeout(__pcCheck, 4000)
+  state.__pcCleanup = () => {
+    if (__pcT1) clearTimeout(__pcT1)
+    if (__pcT2) clearTimeout(__pcT2)
+    audio.removeEventListener('loadedmetadata', __pcCheck)
+    audio.removeEventListener('durationchange', __pcCheck)
+  }
   audio.play().catch(() => {})
 
   try {
@@ -776,6 +822,7 @@ async function startSong (song, only) {
     $('#lyricInner').innerHTML = '<p class="lyric-empty">暂无歌词</p>'
     $('#lyricRoll').innerHTML = '<p class="lyric-empty">暂无歌词</p>'
   }
+  if (token !== state.playToken) return
   addRecent(song)
   renderQueue()
   saveQueue()
@@ -910,59 +957,82 @@ async function onAudioError () {
 
 async function reloadCurrent () {
   if (!state.currentSong) return
+  const token = state.playToken          /* B54: 切音质也要防切歌竞态 */
   const t = audio.currentTime
   const prevSrc = audio.src
   const prevQuality = state.quality
   const wanted = state.quality
   toast('正在切换音质…', 1200)
 
-  const next = await streamSrc(state.currentSong)
-
-  /* 切不回来就原地恢复，绝不让播放中断 */
+  /* B2: timer 必须先声明，否则 fallback 里 clearTimeout(timer) 踩 TDZ */
+  let timer = null
   let settled = false
+
+  const rollbackUi = () => {
+    const sel = $('#qualitySelect')
+    if (sel) sel.value = state.quality
+    $$('.dd-panel .dd-item').forEach((it) => it.classList.toggle('active', it.dataset.v === state.quality))
+  }
+
   const fallback = (msg) => {
     if (settled) return
     settled = true
-    clearTimeout(timer)
+    if (timer) { clearTimeout(timer); timer = null }
     state.quality = prevQuality
     saveSettings()
+    rollbackUi()
     if (prevSrc) {
       audio.src = prevSrc
       audio.currentTime = t
       audio.play().catch(() => {})
     }
-    $$('.dd-panel .dd-item').forEach((it) => it.classList.toggle('active', it.dataset.v === state.quality))
     toast(msg || ('这首歌没有 ' + qualityLabel(wanted) + ' 音质，已保持原音质'), 3000)
+  }
+
+  let next = ''
+  try { next = await streamSrc(state.currentSong) } catch (e) { next = '' }
+
+  /* 期间切歌了：直接放弃这次音质切换，不碰 audio */
+  if (token !== state.playToken) {
+    settled = true
+    if (timer) clearTimeout(timer)
+    return
   }
 
   if (!next) return fallback()
 
-  const timer = setTimeout(() => fallback('该音质加载超时，已保持原音质'), 3500)
+  timer = setTimeout(() => fallback('该音质加载超时，已保持原音质'), 3500)
 
-  audio.addEventListener('error', function onErr () {
+  const cleanup = () => {
     audio.removeEventListener('error', onErr)
-    fallback()
-  }, { once: true })
+    audio.removeEventListener('canplay', onOk)
+  }
 
-  audio.addEventListener('canplay', function onOk () {
-    if (settled) return
+  function onErr () {
+    cleanup()
+    if (token !== state.playToken) return
+    fallback()
+  }
+
+  function onOk () {
+    if (settled || token !== state.playToken) { cleanup(); return }
     settled = true
-    clearTimeout(timer)
+    if (timer) { clearTimeout(timer); timer = null }
+    cleanup()
     audio.currentTime = t
     audio.play().catch(() => {})
     toast('音质：' + qualityLabel(state.quality), 1400)
-  }, { once: true })
+  }
+
+  audio.addEventListener('error', onErr)
+  audio.addEventListener('canplay', onOk)
 
   audio.src = next
   try { audio.load() } catch (e) {}
 }
 
 /* 从上一个播放地址推断当前音质（切换失败时回退用） */
-function prevAudioQuality (src) {
-  if (!src) return state.quality
-  const m = String(src).match(/quality=([a-z0-9]+)/i)
-  return m ? m[1] : state.quality
-}
+
 
 
 /* 下载前询问格式：返回 'mp3' | 'flac' | null */
@@ -977,7 +1047,7 @@ function askDownloadFormat (song) {
     wrap.innerHTML = ''
       + '<div style="background:var(--panel-a,#fff);border-radius:10px;padding:22px 24px;min-width:340px;box-shadow:0 18px 48px rgba(0,0,0,.28)">'
       + '  <div style="font-size:16px;font-weight:600;color:var(--text,#222);margin-bottom:6px">选择下载格式</div>'
-      + '  <div style="font-size:12.5px;color:var(--text-3,#888);margin-bottom:18px;max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + (song ? (song.name + ' - ' + song.singer) : '') + '</div>'
+      + '  <div style="font-size:12.5px;color:var(--text-3,#888);margin-bottom:18px;max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(song ? (song.name + ' - ' + song.singer) : '') + '</div>'
       + '  <div style="display:flex;gap:10px;margin-bottom:16px">'
       + '    <button data-f="mp3" style="flex:1;padding:14px 10px;border:1px solid var(--border-strong,#ccc);border-radius:8px;background:var(--bg-input,#f7f7f7);color:var(--text,#222);cursor:pointer;font-size:13.5px">MP3 320K<br><span style="font-size:11px;color:var(--text-3,#999)">兼容性最好</span></button>'
       + '    <button data-f="flac" style="flex:1;padding:14px 10px;border:1px solid var(--border-strong,#ccc);border-radius:8px;background:var(--bg-input,#f7f7f7);color:var(--text,#222);cursor:pointer;font-size:13.5px">FLAC 无损<br><span style="font-size:11px;color:var(--text-3,#999)">体积较大</span></button>'
@@ -1026,7 +1096,9 @@ async function downloadSong (song) {
           toast('下载失败：' + ((r && r.error) || '未知错误'), 3600)
         }
       }
-      window.NAPI.download(d.url, safe + '.mp3')
+      /* B64: 选 FLAC 时文件名也要是 .flac，否则播放器按 mp3 解码失败 */
+        const __ext = state.dlFormat === 'flac' ? '.flac' : '.mp3'
+        window.NAPI.download(d.url, safe + __ext)
     } catch (e) {
       state.downloading.delete(key)
       toast('下载失败：' + e.message, 3000)
@@ -1048,7 +1120,8 @@ async function downloadSong (song) {
       state.downloads = state.downloads.slice(0, 30)
       LS.set('lx.downloads', state.downloads)
       state.downloading.delete(key)
-      try { renderList && renderList() } catch (e) { }
+      /* B86: renderList 全文件不存在，这里换成真实入口 */
+  try { if (state.view === 'downloads') renderDownloadsView() } catch (e) { }
       return
     }
   } catch (e) {
@@ -1059,7 +1132,7 @@ async function downloadSong (song) {
   try {
     const p = songParams(song)
     /* 直存失败：只提示，不再触发浏览器下载（那是弹窗来源） */
-    toast('下载失败：目录不可写，请在设置里换个位置（如 D:\\Music）', 4200)
+    toast('下载失败：' + ((r0 && r0.error) || '未知错误'), 4200)
   } catch (e) {
     toast('下载失败：' + e.message, 3000)
   } finally {
@@ -1141,7 +1214,20 @@ function syncLyric (time) {
   if (idx >= 0 && lines[idx]) {
     const h = $('#lyricScroll').clientHeight / 2
     const offset = lines[idx].offsetTop + lines[idx].clientHeight / 2
+    /* B11/B60: 移动端 CSS 把 .lyric-inner 设成 position:static + transform:none !important，
+       JS 的 translateY 被压掉 → 歌词不跟随。static 布局下改用滚动容器的 scrollTop。 */
+    {
+      const __sc = $('#lyricScroll')
+      const __inner = $('#lyricInner')
+      const __staticFlow = __inner && window.getComputedStyle(__inner).position === 'static'
+      const __line = lines[idx]
+      if (__staticFlow && __sc && __line) {
+        const __t = __line.offsetTop - __sc.clientHeight / 2 + __line.clientHeight / 2
+        try { __sc.scrollTo({ top: Math.max(0, __t), behavior: 'smooth' }) } catch (e) { __sc.scrollTop = Math.max(0, __t) }
+      } else {
     $('#lyricInner').style.transform = `translateY(${-offset + h}px)`
+      }
+    }
   }
   const roll = $('#lyricRoll').querySelectorAll('.ll')
   roll.forEach((el, i) => el.classList.toggle('active', i === idx))
@@ -1195,7 +1281,8 @@ function showHistory () {
 
 async function doSearch (append = false) {
   const kw = $('#searchInput').value.trim()
-  if (!kw || state.loading) return
+  /* B66: 不再因 loading 丢弃新搜索 */
+  if (!kw) return
   state.keyword = kw
   state.view = 'search'
   state.loading = true
@@ -1977,14 +2064,17 @@ async function renderSourcesPane () {
     toast('已重新加载')
   }
   $('#btnImportUrl').onclick = async () => {
-    const url = $('#importUrl') || { innerHTML: '', textContent: '', style: {}, value: '', classList: { add () {}, remove () {}, toggle () {} }, addEventListener () {}, appendChild () {}, querySelector () { return null }, querySelectorAll () { return [] }, setAttribute () {} }.value.trim()
-    if (!url) return toast('请填写地址')
+    /* B1: 不能写成 `$('#x') || {兜底}.value.trim()`，
+       那样 url 拿到的是 HTMLElement，split 会 TypeError */
+    const urlEl = $('#importUrl')
+    const url = (urlEl && urlEl.value ? urlEl.value : '').trim()
+    if (!url || !/^https?:\/\//i.test(url)) return toast('请填写 http(s) 开头的脚本地址')
     toast('正在导入…')
     try {
       const name = (url.split('/').pop() || 'imported').replace(/\.js.*$/i, '')
       await api('/api/sources/import', { method: 'POST', body: { name, url } })
       await renderSourcesPane()
-      toast('导入完成')
+      toast('导入完成，请先确认来源可信再启用')
     } catch (e) { toast('导入失败：' + e.message, 4000) }
   }
   $('#btnSpeedTest').onclick = async () => {
@@ -2148,26 +2238,59 @@ function renderSettingsPane () {
         } catch (e) { }
       }
     }
-    if (window.chrome && window.chrome.webview && window.chrome.webview.addEventListener) {
-      window.chrome.webview.addEventListener('message', (ev) => {
-        const data = String(ev.data || '')
-        if (data.startsWith('openDirFail:')) {
-          const p2 = data.slice('openDirFail:'.length)
-          toast('系统不允许自动打开文件夹，路径已复制：' + p2, 5000)
-          try { navigator.clipboard.writeText(p2) } catch (e) { }
-          return
-        }
-        if (!data.startsWith('dirPicked:')) return
-        const dir = data.slice('dirPicked:'.length)
-        const inp = $('#dlDir') || { innerHTML: '', textContent: '', style: {}, value: '', classList: { add () {}, remove () {}, toggle () {} }, addEventListener () {}, appendChild () {}, querySelector () { return null }, querySelectorAll () { return [] }, setAttribute () {} }
-        if (inp) inp.value = dir
-        api('/api/download-dir?set=' + encodeURIComponent(dir)).then((r) => {
-          if (r && r.writable === false) toast('已设为：' + dir + '（当前进程写不进去，重启程序后一般正常）', 4200)
-          else toast('下载目录已设为：' + dir, 3000)
-        }).catch((e) => toast('设置失败：' + e.message, 3000))
-      })
+    bindWebviewMessage()
+
+    /* B10: 之前这几组控件完全没有 onclick，点了没反应 */
+    $$('[data-mode]').forEach((b) => {
+      b.onclick = () => { try { setThemeMode(b.dataset.mode) } catch (e) { } }
+    })
+    $$('[data-sleep]').forEach((b) => {
+      b.onclick = () => { try { setSleep(Number(b.dataset.sleep) || 0, true) } catch (e) { } }
+    })
+    const __sd = $('#setDesktop')
+    if (__sd) __sd.onclick = () => { try { openDesktopLyric() } catch (e) { } }
+    const __rd = $('#btnResetData')
+    if (__rd) {
+      __rd.onclick = async () => {
+        if (!window.confirm('清空全部歌单与本地缓存？此操作不可恢复')) return
+        try {
+          const arr = (state.playlists || []).filter((x) => x.id !== 'default')
+          for (const pl of arr) {
+            await api('/api/playlist', { method: 'POST', body: { action: 'delete', id: pl.id } }).catch(() => { })
+          }
+          localStorage.clear()
+          toast('已清空，正在重载…', 2000)
+          setTimeout(() => location.reload(), 800)
+        } catch (e) { toast('清空失败：' + e.message, 3000) }
+      }
     }
   }
+}
+
+/* B6: 原来每开一次设置面板就往 chrome.webview 上多挂一个 message 监听，
+   开过 N 次就弹 N 条「下载目录已设为…」，还连发 N 次请求。改成模块级单次绑定。 */
+let __wvMsgBound = false
+function bindWebviewMessage () {
+  if (__wvMsgBound) return
+  if (!(window.chrome && window.chrome.webview && window.chrome.webview.addEventListener)) return
+  __wvMsgBound = true
+  window.chrome.webview.addEventListener('message', (ev) => {
+    const data = String(ev.data || '')
+    if (data.startsWith('openDirFail:')) {
+      const p2 = data.slice('openDirFail:'.length)
+      toast('系统不允许自动打开文件夹，路径已复制：' + p2, 5000)
+      try { navigator.clipboard.writeText(p2) } catch (e) { }
+      return
+    }
+    if (!data.startsWith('dirPicked:')) return
+    const dir = data.slice('dirPicked:'.length)
+    const inp = $('#dlDir')
+    if (inp) inp.value = dir
+    api('/api/download-dir?set=' + encodeURIComponent(dir)).then((r) => {
+      if (r && r.writable === false) toast('已设为：' + dir + '（当前进程写不进去，重启程序后一般正常）', 4200)
+      else toast('下载目录已设为：' + dir, 3000)
+    }).catch((e) => toast('设置失败：' + e.message, 3000))
+  })
 }
 
 function setSleep (minutes, rerender) {
@@ -2207,6 +2330,9 @@ function onHotkey (e) {
 
 /* ================= 视图切换 ================= */
 function switchView (name) {
+  /* B65: 离开预览页就作废，避免迟到的响应覆盖当前页面 */
+  if (name !== 'preview' && name !== 'now' && name !== 'play') previewCtx = null
+
   navPush({ view: name, keyword: name === 'search' ? state.keyword : undefined })
   state.view = name
   /* 清空预览页留下的操作按钮，避免常驻 */
@@ -2331,7 +2457,11 @@ async function renderDownloadsView () {
 }
 
 /* ================= 启动 ================= */
-boot()
+boot().catch((e) => {
+  console.error('[boot] 初始化失败', e)
+  const box = $('#panelList')
+  if (box) box.innerHTML = '<div class="empty"><b>初始化失败</b><br>' + esc(e && e.message || e) + '</div>'
+})
 
 /* 移动端：注册 Service Worker（可添加到主屏，像 App 一样全屏运行） */
 if ('serviceWorker' in navigator && /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent)) {

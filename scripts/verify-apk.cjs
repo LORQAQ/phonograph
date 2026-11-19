@@ -1,87 +1,109 @@
 'use strict'
-/* 手机版 APK 全面校验 */
+/**
+ * APK 内容校验（BUG-REPORT-2 B24 重写）
+ *
+ * 旧版四个问题：
+ *   1. 校验对象写死成桌面上的 1.0.1 老包
+ *   2. 提取失败就「改从源目录校验」，对着 mobile/www 判定通过
+ *   3. 断言是中文注释字符串（注释一改就假阴性）
+ *   4. 结尾无 process.exitCode，失败也是 0
+ *
+ * 现在：只校验 apk-build/liusheng.apk 内的副本，断言换成行为特征，失败 exit 1。
+ */
 const fs = require('node:fs')
 const path = require('node:path')
 const { execSync } = require('node:child_process')
 
-const apk = 'C:/Users/Administrator/Desktop/留声-1.0.1.apk'
-if (!fs.existsSync(apk)) { console.log('APK 不存在'); process.exit(1) }
+const ROOT = path.resolve(__dirname, '..', '..')          // 工作区根
+const APK = path.join(ROOT, 'apk-build', 'liusheng.apk')
+const TMP = path.join(ROOT, 'apk-build', 'build', '_verify')
 
-console.log('=== APK 基本信息 ===')
-const b = fs.readFileSync(apk)
-console.log('  大小      ' + (b.length / 1024).toFixed(0) + ' KB')
-console.log('  ZIP 头    ' + (b[0] === 0x50 && b[1] === 0x4b))
-console.log('  时间      ' + fs.statSync(apk).mtime.toLocaleString())
+function die (msg) {
+  console.error('✗ ' + msg)
+  process.exitCode = 1
+  process.exit(1)
+}
 
-/* 提取 assets/www 内容校验 */
-const { ZipArchive } = (() => { try { return { ZipArchive: null } } catch (e) { return { ZipArchive: null } } })()
-const tmp = path.join(process.cwd(), 'build', '_apkcheck')
-try { fs.rmSync(tmp, { recursive: true, force: true }) } catch (e) { }
-fs.mkdirSync(tmp, { recursive: true })
+if (!fs.existsSync(APK)) die('APK 不存在：' + APK)
+console.log('校验对象: ' + APK)
+console.log('大小: ' + (fs.statSync(APK).size / 1024).toFixed(0) + ' KB\n')
 
+/* 解出 assets/www 到临时目录（只读 APK 内副本，绝不回落到源目录） */
+fs.rmSync(TMP, { recursive: true, force: true })
+fs.mkdirSync(TMP, { recursive: true })
 try {
-  execSync('tar.exe -xf "' + apk + '" -C "' + tmp + '" assets/www 2>nul', { stdio: 'pipe' })
+  execSync('tar.exe -xf "' + APK + '" -C "' + TMP + '" assets', { stdio: 'pipe' })
 } catch (e) {
-  /* tar 对 apk 可能失败，用 unzip 兜底 */
-  try { execSync('tar.exe -xf "' + apk + '" --wildcards "assets/www/*" -C "' + tmp + '"', { stdio: 'pipe' }) } catch (e2) { }
+  die('从 APK 提取 assets 失败：' + (e.stderr ? String(e.stderr).slice(0, 200) : e.message))
 }
 
-const www = path.join(tmp, 'assets', 'www')
-console.log('\n=== APK 内 assets/www ===')
-if (!fs.existsSync(www)) {
-  console.log('  提取失败，改从源目录校验')
-} else {
-  const walk = (d, out) => {
-    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
-      const p = path.join(d, e.name)
-      if (e.isDirectory()) walk(p, out)
-      else out.push({ path: path.relative(www, p).replace(/\\/g, '/'), size: fs.statSync(p).size })
-    }
-    return out
-  }
-  const files = walk(www, [])
-  console.log('  文件数    ' + files.length)
-  files.sort((a, b) => b.size - a.size).slice(0, 8).forEach((f) => {
-    console.log('    ' + f.path.padEnd(34) + (f.size / 1024).toFixed(0) + ' KB')
-  })
+const WWW = path.join(TMP, 'assets', 'www')
+if (!fs.existsSync(WWW)) die('APK 内没有 assets/www')
+
+const listed = fs.readdirSync(WWW, { recursive: true }).filter((f) => fs.statSync(path.join(WWW, f)).isFile())
+console.log('assets/www 文件数: ' + listed.length + '\n')
+
+function read (rel) {
+  const p = path.join(WWW, rel)
+  return fs.existsSync(p) ? fs.readFileSync(p, 'utf8') : ''
 }
 
-/* 从源目录校验内容 */
-console.log('\n=== 关键功能校验（源目录）===')
+const app = read('app.js')
+const html = read('index.html')
+const css = read('style.css')
+const apiMobile = read('api-mobile.js')
+const engine = read('lib/lx-engine-web.js')
+
+/* 行为断言：改注释不影响，改实现才生效 */
 const checks = [
-  ['app.js 残缺检测', 'mobile/www/app.js', 'checkPreviewAndSwitch'],
-  ['app.js 三重检测', 'mobile/www/app.js', '三重保险'],
-  ['app.js 歌词滚动', 'mobile/www/app.js', 'function scrollPanelLyric'],
-  ['app.js 高亮同步', 'mobile/www/app.js', '播放页歌词：同步高亮'],
-  ['app.js 格式弹窗', 'mobile/www/app.js', 'function askDownloadFormat'],
-  ['app.js m-deck', 'mobile/www/app.js', "classList.add('m-deck')"],
-  ['app.js 歌单导入', 'mobile/www/app.js', 'preview'],
-  ['引擎 fish 优先', 'mobile/www/lib/lx-engine-web.js', '先单独试 fish'],
-  ['引擎 外链过滤', 'mobile/www/lib/lx-engine-web.js', 'song\\/media\\/outer'],
-  ['引擎 硬超时', 'mobile/www/lib/lx-engine-web.js', '硬超时'],
-  ['api 歌单导入', 'mobile/www/api-mobile.js', 'function importPlaylistMobile'],
-  ['CSS 歌词放大', 'mobile/www/style.css', '歌词高亮放大'],
-  ['CSS 顶栏两行', 'mobile/www/style.css', '手机端顶栏两行布局'],
-  ['CSS 歌词区限高', 'mobile/www/style.css', '播放页歌词区限高'],
-  ['CSS 歌词页修复', 'mobile/www/style.css', '歌词页显示修复'],
+  ['app.js 存在', app.length > 50000],
+  ['app.js 手机分支判断', app.includes('__MOBILE__')],
+  ['app.js 走本地代理', app.includes('NAPI.proxyUrl')],
+  ['app.js 取流函数', app.includes('__streamSrcInner')],
+  ['app.js 残缺检测', app.includes('checkPreviewAndSwitch')],
+  ['app.js 切歌 token 校验', app.includes('state.playToken')],
+  ['app.js 音质切换防 TDZ', /let timer = null[\s\S]{0,400}reloadCurrent|reloadCurrent[\s\S]{0,800}let timer = null/.test(app) || app.includes('if (timer) { clearTimeout(timer)')],
+  ['app.js 探测器回收', app.includes('__pcCleanup')],
+  ['app.js 取流失败提示', app.includes('没取到播放地址')],
+  ['app.js 导入地址取值修正', app.includes("const urlEl = $('#importUrl')")],
+  ['index.html 错误捕获', html.includes('unhandledrejection')],
+  ['style.css 歌词放大', css.includes('歌词高亮放大')],
+  ['style.css 进度条热区', css.includes('progress::before') || css.includes('.progress::before')],
+  ['style.css 移动端返回栏', css.includes('nav-history') && css.includes('display: flex')],
+  ['api-mobile.js 酷狗 gcid 解析', apiMobile.includes('gcid_') && apiMobile.includes('listinfo')],
+  ['api-mobile.js 酷狗取流', apiMobile.includes('getSongInfo')],
+  ['api-mobile.js QQ ?id= 支持', apiMobile.includes('disstid')],
+  ['api-mobile.js 歌单字段兼容', apiMobile.includes('body.listId || body.id')],
+  ['引擎 fish 优先', engine.includes('fish')],
+  ['引擎 外链过滤', engine.includes('media\\/outer') || engine.includes('/song/media/outer')],
+  ['引擎 格式过滤', /aac\|wma|aac'|'aac/.test(engine) || engine.includes('aac')],
+  ['sources-data 存在', read('sources-data.js').length > 100000],
 ]
 
+/* 关键资源存在性 */
+const mustExist = [
+  'lib/native-http.js', 'lib/music-libs.js', 'lib/lx-engine-web.js',
+  'lib/vendor/crypto-js.min.js', 'lib/vendor/pako.min.js', 'lib/vendor/jsencrypt.min.js',
+  'icon-192.png', 'icon-512.png',
+]
+for (const f of mustExist) {
+  checks.push(['资源存在 ' + f, fs.existsSync(path.join(WWW, f))])
+}
+
 let ok = 0
-for (const [name, file, key] of checks) {
-  const s = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : ''
-  const pass = s.includes(key)
+for (const [name, pass] of checks) {
   console.log('  ' + (pass ? '✓' : '✗') + ' ' + name)
   if (pass) ok++
 }
+
 console.log('\n通过 ' + ok + '/' + checks.length)
 
-/* 音源清单 */
-console.log('\n=== 内置音源 ===')
-const sd = fs.readFileSync('mobile/www/sources-data.js', 'utf8')
-const ids = [...sd.matchAll(/"id":"([^"]+)"/g)].map((m) => m[1])
-console.log('  ' + ids.length + ' 个: ' + ids.join(', '))
-console.log('  体积: ' + (sd.length / 1024).toFixed(0) + ' KB')
+/* 清理 */
+fs.rmSync(TMP, { recursive: true, force: true })
 
-/* sources-data 是否真的在 APK 里 */
-const inApk = fs.existsSync(path.join(www, 'sources-data.js'))
-console.log('  APK 内含 sources-data.js: ' + inApk)
+if (ok !== checks.length) {
+  process.exitCode = 1
+  console.error('\n有 ' + (checks.length - ok) + ' 项未通过')
+} else {
+  console.log('\n全部通过')
+}

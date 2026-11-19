@@ -6,6 +6,8 @@
   'use strict'
 
   let seq = 0
+  /* B79: 页面重载后 seq 从 1 重来，旧页面的残留响应会串进新请求。加会话前缀丢弃。 */
+  const __HTTP_SESSION = Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
   const pending = new Map()
 
   /* 原生通过 evaluateJavascript 回调这里 */
@@ -21,13 +23,13 @@
     return new Promise((resolve, reject) => {
       const bridge = window.NAPI
       if (!bridge) { reject(new Error('原生桥不可用')); return }
-      const id = String(++seq)
+      const id = __HTTP_SESSION + ':' + (++seq)
       const timeout = setTimeout(() => {
         if (pending.has(id)) {
           pending.delete(id)
           reject(new Error('请求超时'))
         }
-      }, 25000)
+      }, Math.max(1500, Math.min(60000, Number(opts.timeout) || 25000)))
 
       pending.set(id, (res) => {
         clearTimeout(timeout)
@@ -37,7 +39,13 @@
         }
         if (!r) { reject(new Error('无响应')); return }
         if (r.error) { reject(new Error(r.error)); return }
-        resolve({ status: r.status || 200, body: r.body || '' })
+        resolve({
+          status: r.status || 200,
+          /* B22: 音源脚本按 statusCode / headers 取值，这里补别名 */
+          statusCode: r.status || 200,
+          headers: r.headers || {},
+          body: r.body || '',
+        })
       })
 
       const payload = JSON.stringify({

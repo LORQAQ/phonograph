@@ -50,12 +50,27 @@
     /* 网易云 */
     let m = u.match(/music\.163\.com[^#]*[#/]playlist\?[^#]*id=(\d+)/) || u.match(/[?&]id=(\d+)/)
     if (/music\.163\.com/.test(u) && m) return { platform: 'wy', id: m[1] }
-    /* QQ 音乐 */
-    m = u.match(/y\.qq\.com[^#]*playlist\/(\d+)/) || u.match(/playlist\/(\d+)/)
-    if (/qq\.com/.test(u) && m) return { platform: 'tx', id: m[1] }
-    /* 酷狗 */
-    m = u.match(/kugou\.com[^#]*special\/single\/(\d+)/) || u.match(/special\/single\/(\d+)/)
-    if (/kugou\.com/.test(u) && m) return { platform: 'kg', id: m[1] }
+    /* QQ 音乐：支持三种写法
+       y.qq.com/n/ryqq/playlist/123
+       y.qq.com/.../playlist.html?...&id=123
+       i2.y.qq.com/n3/other/pages/details/playlist.html?...&id=123      */
+    if (/qq\.com/.test(u)) {
+      m = u.match(/playlist\/(\d+)/) ||
+          u.match(/[?&](?:id|disstid)=(\d+)/) ||
+          u.match(/playlist\.html[^#]*[?&]id=(\d+)/)
+      if (m) return { platform: 'tx', id: m[1] }
+    }
+    /* 酷狗：两种写法
+       kugou.com/yy/special/single/123.html        （数字 id）
+       m.kugou.com/songlist/gcid_xxxx/             （gcid）  */
+    if (/kugou\.com/.test(u)) {
+      m = u.match(/special\/single\/(\d+)/)
+      if (m) return { platform: 'kg', id: m[1] }
+      m = u.match(/(gcid_[a-z0-9]+)/i)
+      if (m) return { platform: 'kg', id: m[1] }
+      m = u.match(/songlist\/([a-z0-9_]+)/i)
+      if (m) return { platform: 'kg', id: m[1] }
+    }
     return null
   }
 
@@ -107,6 +122,71 @@
     }
 
     if (platform === 'kg') {
+      /* gcid 走 HTML 解析 */
+      /* gcid_ 开头的歌单没有公开 API，只能从 songlist 页面的首屏数据里解析 */
+      if (/^gcid_/i.test(id) || /^[a-z0-9]{14,}$/i.test(id)) {
+        const html = await nativeHttp('https://m.kugou.com/songlist/' + (String(id).startsWith('gcid_') ? id : 'gcid_' + id) + '/', {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 Chrome/126.0.0.0 Mobile Safari/537.36',
+            Referer: 'https://m.kugou.com/',
+          },
+          insecure: true,
+        })
+        const text = String(html.body || '')
+        /* 歌单名在 window.$output.info.listinfo.name */
+        let plName = ''
+        let plCover = ''
+        const li = /"listinfo"\s*:\s*\{/.exec(text)
+        if (li) {
+          const seg = text.slice(li.index, li.index + 3000)
+          const nm = /"name"\s*:\s*"([^"]{1,80})"/.exec(seg)
+          if (nm) plName = nm[1]
+          const pc = /"pic"\s*:\s*"([^"]{10,200})"/.exec(seg)
+          if (pc) plCover = pc[1].replace(/\\\//g, '/').replace('{size}', '300')
+        }
+        if (!plName) {
+          const nm2 = /"specialname"\s*:\s*"([^"]{1,80})"/.exec(text)
+          if (nm2) plName = nm2[1]
+        }
+        const idx = text.indexOf('"songs":[')
+        if (idx < 0) throw new Error('这个酷狗歌单打不开（可能需要 App 内打开）')
+        /* 配平括号提取数组 */
+        let depth = 0; let start = -1; let inStr = false; let esc = false; let end = -1
+        for (let i = idx + 8; i < text.length; i++) {
+          const ch = text[i]
+          if (inStr) {
+            if (esc) { esc = false; continue }
+            if (ch === '\\') { esc = true; continue }
+            if (ch === '"') inStr = false
+            continue
+          }
+          if (ch === '"') { inStr = true; continue }
+          if (ch === '[') { if (depth === 0) start = i; depth++ }
+          else if (ch === ']') { depth--; if (depth === 0 && start >= 0) { end = i; break } }
+        }
+        if (start < 0 || end < 0) throw new Error('酷狗歌单数据解析失败')
+        const arrStr = text.slice(start, end + 1).replace(/\\\//g, '/')
+        let raw = null
+        try { raw = JSON.parse(arrStr) } catch (e) { throw new Error('酷狗歌单 JSON 解析失败') }
+        const songs = (raw || []).map((x) => {
+          const nm = String(x.name || '').trim()
+          const parts = nm.split(' - ')
+          const hash = String(x.hash || '')
+          if (!hash || !nm) return null
+          return {
+            id: hash,
+            source: 'kg',
+            name: parts.length > 1 ? parts.slice(1).join(' - ') : nm,
+            singer: parts.length > 1 ? parts[0] : '',
+            album: (x.albuuminfo && x.albuuminfo.name) || '',
+            albumId: String(x.album_id || ''),
+            durationText: msToText(Number(x.duration || 0) * 1000),
+            cover: String(x.cover || '').replace('{size}', '300'),
+          }
+        }).filter(Boolean)
+        if (!songs.length) throw new Error('酷狗歌单是空的')
+        return { platform: 'kg', name: plName || '酷狗歌单', cover: plCover, songs, skipped: 0 }
+      }
       /* 酷狗歌单：实测 mobilecdn 的两个接口可用（需要 insecure 跳过证书校验） */
       const kgHeaders = {
         'User-Agent': 'Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 Chrome/126.0.0.0 Mobile Safari/537.36',
@@ -324,9 +404,9 @@
       const source = q.get('source') || 'wy'
       const offset = Math.max(0, Number(q.get('offset') || 0))
       const limit = Math.min(60, Math.max(6, Number(q.get('limit') || 30)))
-      if (source === 'tx') return { platform: source, offset, playlists: await NET_TX.recommendPlaylists(offset, limit), newSongs: [] }
-      if (source === 'kg') return { platform: source, offset, playlists: await NET_KG.recommendPlaylists(offset, limit), newSongs: [] }
-      return { platform: source, offset, playlists: await NET_WY.recommendPlaylists(offset, limit), newSongs: [] }
+      if (source === 'tx') return { platform: source, offset, playlists: await NET_TX.recommendPlaylists(offset, limit), newSongs: (source === 'wy' && NET_WY.newSongs) ? await NET_WY.newSongs(10).catch(() => []) : [] }
+      if (source === 'kg') return { platform: source, offset, playlists: await NET_KG.recommendPlaylists(offset, limit), newSongs: (source === 'wy' && NET_WY.newSongs) ? await NET_WY.newSongs(10).catch(() => []) : [] }
+      return { platform: source, offset, playlists: await NET_WY.recommendPlaylists(offset, limit), newSongs: (source === 'wy' && NET_WY.newSongs) ? await NET_WY.newSongs(10).catch(() => []) : [] }
     }
 
     if (p === '/api/lyric') {
@@ -457,11 +537,14 @@
           cover: r0.cover || '',
           createdAt: Date.now(),
         }
-        if (!Array.isArray(d0.playlists)) d0.playlists = []
-        d0.playlists.push(pl)
-        saveDb(d0)
+        /* B19: importPlaylistMobile 可能要跑几秒到几十秒，期间用户可能新建/改名了别的歌单。
+           d0 是 await 之前取的快照，直接写回会把期间的改动整份覆盖掉。这里重新读一次。 */
+        const d1 = db()
+        if (!Array.isArray(d1.playlists)) d1.playlists = []
+        d1.playlists.push(pl)
+        saveDb(d1)
         return {
-          playlists: d0.playlists,
+          playlists: d1.playlists,
           imported: { id: pl.id, name: pl.name, count: songs.length, platform: r0.platform },
         }
       }
@@ -497,7 +580,9 @@
         if (action === 'remove') {
           /* B2: 兼容 listId/songId 与 id/id */
           const listId = body.listId || body.id
-          const songId = body.songId || (body.song && body.song.id)
+          /* B20: 前端发的是 { listId, id: song.id }，body.id 也要认 */
+          const songId = body.songId != null ? body.songId
+            : (body.song && body.song.id != null ? body.song.id : body.id)
           const pl = d.playlists.find((x) => x.id === listId)
           if (pl) {
             pl.songs = (pl.songs || []).filter((s) => String(s.id) !== String(songId))
@@ -573,14 +658,50 @@
       return { id: q.get('id') || '', source: platform, list }
     }
 
+    /* B23: 之前整个 /api/sources/* 子树被一个兜底吃掉，什么也不做直接返回 200 —— 
+       禁用/重载/导入/删除四个操作全部静默失效。这里真正派发。 */
     if (p.startsWith('/api/sources/')) {
       const M = window.LxScriptManager
-      return { ok: true, list: M ? M.list() : [] }
+      if (!M) throw new Error('音源管理器未就绪，请稍后重试')
+      const action = p.slice('/api/sources/'.length)
+
+      if (opts.method === 'POST' || action !== 'list') {
+        if (action === 'toggle') {
+          const r = M.toggle(body && body.id, !!(body && body.enabled))
+          return { list: r || M.list() }
+        }
+        if (action === 'reload') {
+          if (body && body.id) await M.reload(body.id)
+          else await M.loadAll(window.LX_SOURCES || [])
+          return { list: M.list() }
+        }
+        if (action === 'remove') {
+          M.remove(body && body.id)
+          return { list: M.list() }
+        }
+        if (action === 'import') {
+          let code = (body && body.code) || ''
+          if (!code && body && body.url) {
+            const r = await nativeHttp(body.url, { headers: { 'User-Agent': 'Mozilla/5.0' } })
+            code = r.body || ''
+          }
+          if (!code) throw new Error('缺少脚本内容')
+          if (String(code).length > 2 * 1024 * 1024) throw new Error('脚本超过 2MB，拒绝导入')
+          const id = 'custom_' + Date.now().toString(36)
+          await M.addCode(id, code, (body && body.name) || id)
+          return { list: M.list() }
+        }
+      }
+      return { list: M.list() }
     }
 
     if (p === '/api/download') throw new Error('手机端暂不支持直接下载，请用电脑端')
 
-    throw new Error('未实现的接口: ' + p)
+    /* B74: 未实现接口返回可渲染的空结构，不要让前端吃 unhandled rejection */
+    if (p.startsWith('/api/downloads')) return { list: [], total: 0 }
+    if (p === '/api/download-dir') return { dir: '' }
+    console.warn('[api-mobile] 未实现:', p)
+    return { ok: false, error: '手机端不支持这个接口：' + p }
   }
 
   let scriptsLoading = null
@@ -601,8 +722,41 @@
   }
   window.ensureScripts = ensureScripts
 
+  /* B18: /api/url 的缓存层放在这里，不改 mobileApi 内部结构（避免破坏大函数的括号配平）。
+     手机端原来每播一首都要重新跑 fish×3 + 5 源竞速，同一首歌前端还会并发打两次；
+     这里做 in-flight 合并 + 4 分钟 TTL。 */
+  const __urlCache = new Map()
+  const __urlInflight = new Map()
+  const __URL_TTL = 4 * 60e3
+
+  const __mobileApiRaw = mobileApi
+  window.mobileApi = function cachedMobileApi (path, opts = {}) {
+    if (!String(path).startsWith('/api/url')) return __mobileApiRaw(path, opts)
+    let key = ''
+    try {
+      const u = new URL(path, 'http://m.local')
+      const q = u.searchParams
+      key = [q.get('id'), q.get('source') || 'wy', q.get('quality') || '320k', q.get('only') || ''].join('|')
+    } catch (e) {
+      return __mobileApiRaw(path, opts)
+    }
+    const hit = __urlCache.get(key)
+    if (hit && hit.exp > Date.now()) return Promise.resolve(hit.value)
+    if (__urlInflight.has(key)) return __urlInflight.get(key)
+    const job = __mobileApiRaw(path, opts).then((r) => {
+      if (r && r.url) {
+        __urlCache.set(key, { value: r, exp: Date.now() + __URL_TTL })
+        if (__urlCache.size > 200) __urlCache.delete(__urlCache.keys().next().value)
+      }
+      return r
+    }).finally(() => {
+      __urlInflight.delete(key)
+    })
+    __urlInflight.set(key, job)
+    return job
+  }
+
   window.__MOBILE__ = true
-  window.mobileApi = mobileApi
 
 /* 后台预热：脚本初始化不阻塞首次播放 */
 window.preloadScripts = function () {

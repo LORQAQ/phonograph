@@ -14,6 +14,8 @@ const https = require('node:https')
 const fs = require('node:fs')
 const path = require('node:path')
 const os = require('node:os')
+const crypto = require('node:crypto')
+const net = require('node:net')
 const { URL } = require('node:url')
 
 const netease = require('./lib/netease.js')
@@ -41,8 +43,14 @@ function loadDb () {
     /* B6: 解析失败时备份损坏文件，避免用户数据无声消失 */
     try {
       if (fs.existsSync(DB_FILE)) {
-        const bak = DB_FILE + '.bak'
+        /* B45: 时间戳备份，最多留 5 份；固定名 .bak 会被下一次启动覆盖掉 */
+        const bak = DB_FILE + '.corrupt-' + new Date().toISOString().replace(/[:.]/g, '-')
         fs.copyFileSync(DB_FILE, bak)
+        try {
+          const all = fs.readdirSync(DATA).filter((f) => f.startsWith('db.json.corrupt-')).sort()
+          while (all.length > 5) { try { fs.unlinkSync(path.join(DATA, all.shift())) } catch (e) { } }
+        } catch (e) { }
+        global.__DB_RECOVERED_FROM = bak
         console.error('[db] 数据文件损坏，已备份到 ' + bak + '：' + e.message)
       }
     } catch (e2) { }
@@ -64,11 +72,32 @@ if (!Array.isArray(db.playlists) || !db.playlists.length) db.playlists = [{ id: 
 db.settings = Object.assign({ quality: '320k', platform: 'wy', volume: 0.8, sourceOrder: [], disabledSources: [] }, db.settings || {})
 
 let saveTimer = null
+/* B41: 合并写入 + 上限延迟（连续拖音量不会永远不落盘）+ 失败向上抛 */
+let dbDirty = false
+let dbFirstDirtyAt = 0
+
 function saveDb () {
+  dbDirty = true
+  if (!dbFirstDirtyAt) dbFirstDirtyAt = Date.now()
   clearTimeout(saveTimer)
-  saveTimer = setTimeout(() => {
-    try { writeDbNow() } catch (e) { console.warn('保存数据失败', e.message) }
-  }, 300)
+  /* 第一次脏之后最多等 2 秒，之后立刻写 */
+  const wait = Date.now() - dbFirstDirtyAt > 2000 ? 0 : 300
+  saveTimer = setTimeout(flushDb, wait)
+}
+
+function flushDb () {
+  if (!dbDirty) return
+  clearTimeout(saveTimer)
+  saveTimer = null
+  dbDirty = false
+  dbFirstDirtyAt = 0
+  try {
+    writeDbNow()
+  } catch (e) {
+    dbDirty = true
+    console.error('[db] 写盘失败', e.message)
+    throw e
+  }
 }
 
 /* B6: 原子写 —— 先写 .tmp 再 rename，断电不会写坏原文件 */
@@ -81,6 +110,21 @@ function writeDbNow () {
 
 /* ---------------- 音源管理 ---------------- */
 const urlCache = new Map()
+/* B47: LRU 读取/写入（命中时提升到最新） */
+function cacheGet (map, key) {
+  const hit = map.get(key)
+  if (!hit) return null
+  if (hit.exp <= Date.now()) { map.delete(key); return null }
+  map.delete(key); map.set(key, hit)
+  return hit.value
+}
+function cacheSet (map, key, value, ttl, max) {
+  map.delete(key)
+  map.set(key, { value, exp: Date.now() + ttl })
+  if (map.size > max) map.delete(map.keys().next().value)
+}
+/* B18: 同一首歌并发请求时只跑一次解析 */
+const urlInflight = new Map()
 const sourceManager = new SourceManager(path.join(ROOT, 'sources'), db.settings)
 /* QQ 歌单需要登录：把之前保存的 Cookie 注入 */
 try { if (db.settings.qqCookie) qq.setCookie(db.settings.qqCookie) } catch (e) { }
@@ -100,11 +144,92 @@ function json (res, code, data) {
   res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': body.length, 'Cache-Control': 'no-store' })
   res.end(body)
 }
+
+/* ---------------- 安全工具（BUG-REPORT-2） ---------------- */
+
+/* B7: 本地会话 token。外壳启动时通过 env 注入，前端通过 /api/health 拿到 */
+const SESSION_TOKEN = process.env.PHONOGRAPH_TOKEN || crypto.randomBytes(24).toString('hex')
+
+/* B7: 同源校验 —— 只接受本机 origin，防止恶意网页跨站 POST */
+function sameOrigin (req) {
+  const o = req.headers.origin
+  if (!o) return true                       /* 同源 fetch / 无 Origin 的本地请求放行 */
+  return /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/.test(o)
+}
+
+/* B7: 写接口守卫。needWrite=true 时强制 POST/PUT */
+function guard (req, res, needWrite) {
+  if (!sameOrigin(req)) {
+    json(res, 403, { error: '来源不允许' })
+    return false
+  }
+  const tok = req.headers['x-phonograph-token']
+  if (tok !== undefined && tok !== SESSION_TOKEN) {
+    json(res, 403, { error: '令牌无效' })
+    return false
+  }
+  if (needWrite && req.method !== 'POST' && req.method !== 'PUT') {
+    json(res, 405, { error: '仅支持 POST' })
+    return false
+  }
+  return true
+}
+
+/* B6: 私有地址判定 */
+function isPrivateHost (h) {
+  if (!h) return true
+  const host = String(h).toLowerCase()
+  if (typeof net.isIPv4 === 'function' && net.isIPv4(host)) {
+    const [a, b] = host.split('.').map(Number)
+    return a === 10 || a === 127 || a === 0 ||
+           (a === 169 && b === 254) ||
+           (a === 172 && b >= 16 && b <= 31) ||
+           (a === 192 && b === 168) ||
+           (a === 100 && b >= 64 && b <= 127)
+  }
+  if (typeof net.isIPv6 === 'function' && net.isIPv6(host)) {
+    return host === '::1' || /^f[cd]/i.test(host) || /^fe80/i.test(host)
+  }
+  return /^(localhost|.*\.local|.*\.internal)$/i.test(host)
+}
+
+/* B6: 封面只允许这些 CDN */
+const PIC_HOST_ALLOW = [
+  /(^|\.)music\.126\.net$/i,
+  /(^|\.)126\.net$/i,
+  /(^|\.)163\.com$/i,
+  /(^|\.)gtimg\.cn$/i,
+  /(^|\.)y\.qq\.com$/i,
+  /(^|\.)kugou\.com$/i,
+  /(^|\.)kgimg\.com$/i,
+  /(^|\.)kuwo\.cn$/i,
+  /(^|\.)kwcdn\.kuwo\.cn$/i,
+  /(^|\.)migu\.cn$/i,
+  /(^|\.)music\.126\.net$/i,
+]
+
+/* B39: 数字参数统一校验 */
+function intParam (raw, def, min, max) {
+  const n = Number(raw)
+  if (!Number.isFinite(n)) return def
+  return Math.min(max, Math.max(min, Math.trunc(n)))
+}
+
 function readBody (req, limit = 5 * 1024 * 1024) {
   return new Promise((resolve, reject) => {
     const chunks = []
     let size = 0
-    req.on('data', (c) => { size += c.length; if (size > limit) { reject(new Error('请求体过大')); req.destroy(); return } chunks.push(c) })
+    req.on('data', (c) => {
+      size += c.length
+      if (size > limit) {
+        /* B31: 先停止接收并让上层回 413，别急着 destroy（socket 没了就没法回包） */
+        try { req.pause() } catch (e) { }
+        try { req.removeAllListeners('data') } catch (e) { }
+        reject(Object.assign(new Error('请求体过大（上限 ' + limit + ' 字节）'), { code: 413 }))
+        return
+      }
+      chunks.push(c)
+    })
     req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')))
     req.on('error', reject)
   })
@@ -136,10 +261,26 @@ function proxyStream (req, res, targetUrl, opts = {}) {
   const lib = u.protocol === 'https:' ? https : http
   const headers = { 'User-Agent': UA, Referer: refererFor(targetUrl), Accept: '*/*' }
   if (req.headers.range) headers.Range = req.headers.range
-  const upstream = lib.get(u, { headers, timeout: 25000 }, (up) => {
+
+  /* B32: 统一收尾。头已发出时必须 res.destroy()，
+     否则播放器会一直转圈等一个永不完结的响应。 */
+  let finished = false
+  let upstream = null
+  const fail = (code, msg) => {
+    if (finished) return
+    finished = true
+    try { if (upstream) upstream.destroy() } catch (e) { }
+    if (!res.headersSent) {
+      try { json(res, code, { error: msg }) } catch (e) { }
+      return
+    }
+    try { res.destroy() } catch (e) { }
+  }
+
+  upstream = lib.get(u, { headers, timeout: 25000 }, (up) => {
     if (up.statusCode >= 400) {
       up.resume()
-      return json(res, 502, { error: '音频源返回 ' + up.statusCode })
+      return fail(502, '音频源返回 ' + up.statusCode)
     }
     const outHeaders = {
       'Content-Type': up.headers['content-type'] || 'audio/mpeg',
@@ -154,11 +295,13 @@ function proxyStream (req, res, targetUrl, opts = {}) {
     }
     res.writeHead(up.statusCode, outHeaders)
     up.pipe(res)
-    up.on('error', () => { try { res.destroy() } catch (e) {} })
+    up.on('error', () => fail(502, '音频流中断'))
+    up.on('aborted', () => fail(502, '音频流被上游中断'))
+    res.on('close', () => { finished = true; try { up.destroy() } catch (e) { } })
   })
-  upstream.on('error', (e) => { if (!res.headersSent) json(res, 502, { error: '音频代理失败: ' + e.message }) })
-  upstream.on('timeout', () => { upstream.destroy(); if (!res.headersSent) json(res, 504, { error: '音频源超时' }) })
-  req.on('close', () => { try { upstream.destroy() } catch (e) {} })
+  upstream.on('error', (e) => fail(502, '音频代理失败: ' + e.message))
+  upstream.on('timeout', () => fail(504, '音频源超时'))
+  req.on('close', () => { finished = true; try { if (upstream) upstream.destroy() } catch (e) { } })
 }
 
 /* 由歌曲 id 构建 LX musicInfo（按平台） */
@@ -194,12 +337,16 @@ async function buildMusicInfo (platform, id, extra = {}) {
     }
   }
   let d = {}
-  try { d = await netease.detail(id) } catch (e) {}
+  let __detailErr = null
+  try { d = await netease.detail(id) } catch (e) { __detailErr = e; console.warn('[meta] 详情失败', id, e.message) }
   return {
     songmid: String(id),
     id: String(id),
     name: extra.name || d.name || '未知歌曲',
     singer: extra.singer || d.singer || '未知歌手',
+    /* B38: 元数据缺失时不要拿「未知歌曲」去跨平台搜索 */
+    _metaMissing: !(extra.name || d.name),
+    _error: __detailErr ? __detailErr.message : '',
     albumName: extra.album || d.album || '',
     albumId: d.cover || '',
     interval: extra.interval || d.durationText || '00:00',
@@ -219,6 +366,16 @@ function extraFromQuery (q) {
 }
 
 /* ---------------- 路由 ---------------- */
+/* B51: 出口脱敏，不再回显完整 QQ Cookie */
+function publicSettings () {
+  const out = Object.assign({}, db.settings || {})
+  const ck = out.qqCookie
+  delete out.qqCookie
+  out.qqCookieSet = !!ck
+  out.qqCookieTail = ck ? String(ck).slice(-6) : ''
+  return out
+}
+
 const routes = {
   async '/api/lan' () {
     const ips = global.__LAN_IPS || []
@@ -247,8 +404,8 @@ const routes = {
   async '/api/search' (req, q) {
     const kw = (q.get('kw') || '').trim()
     if (!kw) throw Object.assign(new Error('缺少搜索关键词'), { code: 400 })
-    const page = Number(q.get('page') || 1)
-    const limit = Math.min(60, Number(q.get('limit') || 30))
+    const page = intParam(q.get('page'), 1, 1, 200) /* B39 */
+    const limit = intParam(q.get('limit'), 30, 1, 60) /* B39 */
     const platform = q.get('source') || 'wy'
     if (platform === 'tx') return await qq.search(kw, page, limit)
     if (platform === 'kg') return await kugou.search(kw, page, limit)
@@ -263,7 +420,10 @@ const routes = {
     const cacheKey = platform + '|' + id + '|' + quality + '|' + (q.get('only') || '')
     const hit = urlCache.get(cacheKey)
     if (hit && hit.exp > Date.now()) return Object.assign({ id, source: platform, cached: true }, hit.value)
-    await loadPromise.catch(() => {})
+    /* B18: 已有同样的请求在飞，直接复用 */
+    if (urlInflight.has(cacheKey)) return urlInflight.get(cacheKey)
+    const job = (async () => {
+      await loadPromise.catch(() => {})
     const info = await buildMusicInfo(platform, id, extraFromQuery(q))
     const { result, crossFrom } = await resolveWithCross({
       platform, info, quality,
@@ -276,9 +436,12 @@ const routes = {
       sourceId: result.sourceId, url: result.url, attempts: result.attempts,
       crossPlatform: crossFrom || undefined,
     }
-    urlCache.set(cacheKey, { value: payload, exp: Date.now() + 5 * 60e3 })
-    if (urlCache.size > 300) urlCache.delete(urlCache.keys().next().value)
-    return payload
+      urlCache.set(cacheKey, { value: payload, exp: Date.now() + 5 * 60e3 })
+      if (urlCache.size > 300) urlCache.delete(urlCache.keys().next().value)
+      return payload
+    })().finally(() => urlInflight.delete(cacheKey))
+    urlInflight.set(cacheKey, job)
+    return job
   },
 
   async '/api/sources/test' (req, q) {
@@ -399,19 +562,37 @@ const routes = {
 
   /* 打开文件所在文件夹并选中 */
   async '/api/downloads/reveal' (req, q) {
+    /* B15: 与 remove 同一套校验，且不回显绝对路径 */
     const name = q.get('name')
     if (!name) throw Object.assign(new Error('缺少文件名'), { code: 400 })
-    const dir = (q.get('dir') || db.settings.downloadDir || defaultDownloadDir())
-    const full = path.join(dir, name)
-    if (!fs.existsSync(full)) return { ok: false, error: '文件不存在：' + full, path: full }
-    let err = ''
+    if (name.includes('..') || /[\\/]/.test(name)) {
+      throw Object.assign(new Error('非法文件名'), { code: 400 })
+    }
+    if (!/\.(mp3|flac|m4a|ogg|wav)$/i.test(name)) {
+      throw Object.assign(new Error('只能定位音频文件'), { code: 400 })
+    }
+    const roots = [...new Set([
+      db.settings.downloadDir,
+      defaultDownloadDir(),
+      path.join(ROOT, 'downloads'),
+    ].filter(Boolean))].map((d) => { try { return path.resolve(d) } catch (e) { return d } })
+
+    let full = ''
+    for (const root of roots) {
+      const cand = path.resolve(root, name)
+      if (!cand.startsWith(root + path.sep)) continue
+      if (fs.existsSync(cand)) { full = cand; break }
+    }
+    if (!full) return { ok: false, error: '文件不存在' }
     try {
       const { spawn } = require('node:child_process')
-      const c = spawn('explorer.exe', ['/select,' + full], { detached: true, stdio: 'ignore' })
-      c.on('error', (e) => { err = e.message })
-      c.unref()
-    } catch (e) { err = e.message }
-    return { ok: !err, path: full, dir, error: err || undefined }
+      const child = spawn('explorer.exe', ['/select,', full], { detached: true, stdio: 'ignore' })
+      child.on('error', () => { })
+      child.unref()
+      return { ok: true, name }
+    } catch (e) {
+      return { ok: false, error: '打开失败：' + e.message }
+    }
   },
 
   /* 删除已下载文件 */
@@ -429,7 +610,7 @@ const routes = {
       db.settings.downloadDir,
       defaultDownloadDir(),
       path.join(ROOT, 'downloads'),
-      q.get('dir') || '',
+
     ].filter(Boolean))]
     let removed = ''
     for (const d of candidates) {
@@ -473,10 +654,24 @@ const routes = {
           headers: { 'User-Agent': UA, Referer: refererFor(result.url), Accept: '*/*' },
         })
         if (!resp.ok) return json(res, 502, { error: '音频源返回 ' + resp.status })
-        const buf = Buffer.from(await resp.arrayBuffer())
-        if (buf.length < 4096) return json(res, 502, { error: '音频内容为空' })
-        fs.writeFileSync(tmpFile, buf)
+        /* B40: 流式落盘，不再 arrayBuffer() 全量读内存（大 flac 会 OOM）；同时限 400MB */
+        const { Readable, Transform } = require('node:stream')
+        const { pipeline } = require('node:stream/promises')
+        let written = 0
+        const limiter = new Transform({
+          transform (chunk, enc, cb) {
+            written += chunk.length
+            if (written > 400 * 1024 * 1024) return cb(new Error('文件超过 400MB，已中止'))
+            cb(null, chunk)
+          },
+        })
+        await pipeline(Readable.fromWeb(resp.body), limiter, fs.createWriteStream(tmpFile))
+        if (written < 4096) {
+          try { fs.unlinkSync(tmpFile) } catch (e) { }
+          return json(res, 502, { error: '音频内容为空' })
+        }
       } catch (e) {
+        try { fs.unlinkSync(tmpFile) } catch (e2) { }
         return json(res, 502, { error: '下载失败：' + (e.message || e) })
       }
 
@@ -529,7 +724,12 @@ const routes = {
         const dest = path.join(d, targetName)
         if (await psCopy(finalTmp, dest)) { finalPath = dest; usedDir = d; break }
       }
-      try { fs.unlinkSync(tmpFile) } catch (e) { }
+      /* B34: 两个临时文件都要清 —— 转码成功时 finalTmp 是 convOut，
+         原来只删了 tmpFile，convOut 就永久留在 data/ 里（和下载文件一样大） */
+      for (const f of new Set([tmpFile, finalTmp])) {
+        if (!f) continue
+        try { if (path.resolve(f).startsWith(path.resolve(ROOT, 'data'))) fs.unlinkSync(f) } catch (e) { }
+      }
 
       if (!finalPath) return json(res, 502, { error: '所有候选目录都写不进去' })
       let size = 0
@@ -578,7 +778,14 @@ const routes = {
   async '/api/pic' (req, q, res) {
     const direct = q.get('url')
     if (direct) {
-      if (!/^https?:\/\//.test(direct)) return json(res, 400, { error: '无效地址' })
+      /* B6: 只允许 http(s) + 已知 CDN + 非私有地址，否则就是任意 URL 代理（SSRF） */
+      if (!/^https?:\/\//i.test(direct)) return json(res, 400, { error: '无效地址' })
+      let uu = null
+      try { uu = new URL(direct) } catch (e) { return json(res, 400, { error: '非法 URL' }) }
+      if (isPrivateHost(uu.hostname)) return json(res, 403, { error: '不允许的图片地址' })
+      if (!PIC_HOST_ALLOW.some((re) => re.test(uu.hostname))) {
+        return json(res, 403, { error: '不是已知封面域名：' + uu.hostname })
+      }
       proxyStream(req, res, direct)
       return null
     }
@@ -659,18 +866,25 @@ const routes = {
       try { qq.setCookie(db.settings.qqCookie || '') } catch (e) { }
       saveDb()
     }
-    return db.settings
+    return publicSettings()
   },
 
   async '/api/db' () {
-    return { playlists: db.playlists, settings: db.settings, history: db.history }
+    return { playlists: db.playlists, settings: publicSettings(), history: db.history }
   },
 
   async '/api/playlist' (req, q, res, body) {
-    const action = q.get('action') || (body && body.action)
+    /* B30: action 可以来自 query，但后面全程强解 b.* —— body 为 null 时 500。
+       这里统一归一化：body 为空就用 query 拼一个对象。 */
+    const b = body || Object.fromEntries(q.entries())
+    const action = b.action
+    const WRITE_ACTIONS = new Set(['import', 'create', 'rename', 'delete', 'add', 'remove', 'clear'])
+    if (WRITE_ACTIONS.has(action) && req.method !== 'POST') {
+      throw Object.assign(new Error('仅支持 POST'), { code: 405 })
+    }
     if (!action) return { playlists: db.playlists }
     if (action === 'preview') {
-      const url = (body && body.url) || q.get('url')
+      const url = (b && b.url) || q.get('url')
       if (!url) throw Object.assign(new Error('缺少歌单链接'), { code: 400 })
       const r = await importPlaylist(url)
       return {
@@ -679,7 +893,7 @@ const routes = {
       }
     }
     if (action === 'import') {
-      const url = (body && body.url) || q.get('url')
+      const url = (b && b.url) || q.get('url')
       if (!url) throw Object.assign(new Error('缺少歌单链接'), { code: 400 })
       const r = await importPlaylist(url)
       const pl = {
@@ -694,33 +908,33 @@ const routes = {
       return { playlists: db.playlists, imported: { id: pl.id, name: pl.name, count: pl.songs.length, platform: r.platform } }
     }
     if (action === 'create') {
-      const p = { id: 'pl' + Date.now(), name: (body && body.name) || '新建歌单', songs: [] }
+      const p = { id: 'pl' + Date.now(), name: (b && b.name) || '新建歌单', songs: [] }
       db.playlists.push(p); saveDb()
       return { playlists: db.playlists, id: p.id }
     }
     if (action === 'rename') {
-      const p = db.playlists.find((x) => x.id === body.id)
-      if (p) { p.name = body.name; saveDb() }
+      const p = db.playlists.find((x) => x.id === b.id)
+      if (p) { p.name = b.name; saveDb() }
       return { playlists: db.playlists }
     }
     if (action === 'delete') {
-      db.playlists = db.playlists.filter((x) => x.id !== body.id)
+      db.playlists = db.playlists.filter((x) => x.id !== b.id)
       if (!db.playlists.length) db.playlists = [{ id: 'default', name: '默认列表', songs: [] }]
       saveDb()
       return { playlists: db.playlists }
     }
     if (action === 'add') {
-      const p = db.playlists.find((x) => x.id === (body.listId || 'default'))
-      if (p && body.song && !p.songs.some((s) => s.id === body.song.id && (s.source || 'wy') === (body.song.source || 'wy'))) { p.songs.push(body.song); saveDb() }
+      const p = db.playlists.find((x) => x.id === (b.listId || 'default'))
+      if (p && b.song && !p.songs.some((s) => s.id === b.song.id && (s.source || 'wy') === (b.song.source || 'wy'))) { p.songs.push(b.song); saveDb() }
       return { playlists: db.playlists }
     }
     if (action === 'remove') {
-      const p = db.playlists.find((x) => x.id === (body.listId || 'default'))
-      if (p) { p.songs = p.songs.filter((s) => s.id !== body.id); saveDb() }
+      const p = db.playlists.find((x) => x.id === (b.listId || 'default'))
+      if (p) { p.songs = p.songs.filter((s) => s.id !== b.id); saveDb() }
       return { playlists: db.playlists }
     }
     if (action === 'clear') {
-      const p = db.playlists.find((x) => x.id === (body.listId || 'default'))
+      const p = db.playlists.find((x) => x.id === (b.listId || 'default'))
       if (p) { p.songs = []; saveDb() }
       return { playlists: db.playlists }
     }
@@ -761,12 +975,35 @@ function serveStatic (req, res, pathname) {
 }
 
 const server = http.createServer(async (req, res) => {
-  const u = new URL(req.url, 'http://127.0.0.1')
+  /* B33: new URL 原来在 try 外面，畸形请求行（//、http://[::1）会抛未处理拒绝，
+     客户端拿不到任何响应、连接悬挂。挪进 try，失败回 400。 */
+  let u
+  try {
+    u = new URL(req.url || '/', 'http://127.0.0.1')
+  } catch (e) {
+    return json(res, 400, { error: '非法请求路径' })
+  }
   const pathname = u.pathname
   try {
     if (pathname.startsWith('/api/')) {
       const handler = routes[pathname]
       if (!handler) return json(res, 404, { error: '接口不存在' })
+
+      /* B7/B44: 同源校验 + 写接口强制 POST。
+         - 所有 /api/* 校验 Origin（防恶意网页跨站打本地端口）
+         - 破坏性接口额外要求 POST
+         - 允许通过 X-Phonograph-Token 携带会话令牌（可选，外壳注入） */
+      const WRITE_PATHS = new Set([
+        '/api/sources/toggle', '/api/sources/reload', '/api/sources/remove',
+        '/api/sources/import', '/api/playlist', '/api/shutdown',
+        '/api/download-dir',
+      ])
+      if (!sameOrigin(req)) {
+        return json(res, 403, { error: '来源不允许' })
+      }
+      if (WRITE_PATHS.has(pathname) && req.method !== 'POST' && req.method !== 'PUT') {
+        return json(res, 405, { error: '仅支持 POST' })
+      }
       let body = null
       if (req.method === 'POST' || req.method === 'PUT') {
         const raw = await readBody(req)
@@ -784,6 +1021,28 @@ const server = http.createServer(async (req, res) => {
 })
 
 /* S1: 默认只监听本机；要开局域网请设 PHONOGRAPH_LAN=1 */
+/* B34: 启动时清扫 24h 前的下载临时文件 */
+function __cleanupTmp () {
+  try {
+    const dir = path.join(ROOT, 'data')
+    for (const f of fs.readdirSync(dir)) {
+      if (!f.startsWith('.dl_')) continue
+      const fp = path.join(dir, f)
+      try { if (Date.now() - fs.statSync(fp).mtimeMs > 864e5) fs.unlinkSync(fp) } catch (e) { }
+    }
+  } catch (e) { }
+}
+__cleanupTmp()
+
+/* B46: 端口占用时不要静默崩，给外壳一个明确的退出码 */
+server.on('error', (e) => {
+  if (e.code === 'EADDRINUSE') {
+    console.error('[启动] 端口 ' + PORT + ' 已被占用（可能已有一个实例在跑）')
+    process.exit(2)
+  }
+  console.error('[启动] 监听失败', e.message)
+  process.exit(1)
+})
 server.listen(PORT, process.env.PHONOGRAPH_LAN === '1' ? '0.0.0.0' : '127.0.0.1', () => {
   const os = require('node:os')
   const ips = []
@@ -798,5 +1057,14 @@ server.listen(PORT, process.env.PHONOGRAPH_LAN === '1' ? '0.0.0.0' : '127.0.0.1'
   console.log('=========================================')
 })
 
-process.on('SIGINT', () => { server.close(); process.exit(0) })
+/* B41: 所有退出路径都落盘 */
+function shutdownGracefully (code) {
+  try { flushDb() } catch (e) { }
+  try { server.close() } catch (e) { }
+  process.exit(code || 0)
+}
+for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+  try { process.on(sig, () => shutdownGracefully(0)) } catch (e) { }
+}
+process.on('exit', () => { try { flushDb() } catch (e) { } })
 module.exports = { server, db, sourceManager }

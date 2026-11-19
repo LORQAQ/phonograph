@@ -115,13 +115,25 @@ function request (url, options = {}, callback = () => {}) {
         return
       }
       const chunks = []
-      res.on('data', (c) => chunks.push(c))
+      /* B36: 16MB 上限，防 gzip 炸弹/超大响应把主进程打爆 */
+      let size = 0
+      res.on('data', (c) => {
+        size += c.length
+        if (size > 16 * 1024 * 1024) {
+          try { res.destroy() } catch (e) { }
+          finish(new Error('响应体超过 16MB'))
+          return
+        }
+        chunks.push(c)
+      })
+      res.on('error', (e) => finish(e))
       res.on('end', () => {
         let buf = Buffer.concat(chunks)
         const enc = String(res.headers['content-encoding'] || '').toLowerCase()
         try {
-          if (enc.includes('gzip')) buf = zlib.gunzipSync(buf)
-          else if (enc.includes('deflate')) buf = zlib.inflateSync(buf)
+          const MAX_OUT = { maxOutputLength: 16 * 1024 * 1024 }
+          if (enc.includes('gzip')) buf = zlib.gunzipSync(buf, MAX_OUT)
+          else if (enc.includes('deflate')) buf = zlib.inflateSync(buf, MAX_OUT)
           else if (enc.includes('br')) buf = zlib.brotliDecompressSync(buf)
         } catch (e) { /* 忽略解压失败 */ }
         const text = buf.toString('utf8')

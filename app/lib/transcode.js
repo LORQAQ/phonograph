@@ -83,8 +83,11 @@ function unblockFile (filePath) {
   try { fs.unlinkSync(filePath + ':Zone.Identifier') } catch (e) { }
   try {
     const { execFile } = require('node:child_process')
-    const esc = String(filePath).replace(/"/g, '`"')
-    execFile('powershell', ['-NoProfile', '-NonInteractive', '-Command', 'Unblock-File -LiteralPath "' + esc + '"'], { windowsHide: true }, () => { })
+    /* B35: 双引号里 $() 会被 PowerShell 求值（歌名可控即可注入命令）。
+       改单引号，并把 ' 转成 ''。 */
+    const esc = String(filePath).split("'").join("''")
+    const cmd = "Unblock-File -LiteralPath '" + esc + "'"
+    execFile('powershell', ['-NoProfile', '-NonInteractive', '-Command', cmd], { windowsHide: true }, () => { })
   } catch (e) { }
 }
 

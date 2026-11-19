@@ -36,8 +36,10 @@ const cache = new Map()
 function cached (key, ttl, fn) {
   const hit = cache.get(key)
   if (hit && hit.exp > Date.now()) return hit.value
-  const p = fn()
+  const p = Promise.resolve().then(fn)
   cache.set(key, { value: p, exp: Date.now() + ttl })
+  /* B16: 失败（rejected）立即清掉，别让一次抖动锁死 5~30 分钟 */
+  p.catch(() => { const cur = cache.get(key); if (cur && cur.value === p) cache.delete(key) })
   if (cache.size > 200) cache.delete(cache.keys().next().value)
   return p
 }

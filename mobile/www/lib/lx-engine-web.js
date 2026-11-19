@@ -104,7 +104,13 @@
       .then((resp) => {
         if (canceled) return
         const body = resp.body
-        try { callback(null, { statusCode: resp.statusCode, body, headers: resp.headers }, body) } catch (e) {}
+        /* B22: resp 里可能只有 status，取不到就退回 200；回调异常不再静默吞掉 */
+        const _status = resp.statusCode != null ? resp.statusCode : (resp.status != null ? resp.status : 200)
+        try {
+          callback(null, { statusCode: _status, headers: resp.headers || {}, body }, body)
+        } catch (e) {
+          console.warn('[lx] 脚本回调异常', e && e.stack ? e.stack : e)
+        }
       })
       .catch((err) => { if (!canceled) callback(err) })
     return function cancel () { canceled = true }
@@ -120,10 +126,15 @@
     const keyLen = parseInt(m[1], 10) / 8
     const modeName = m[2]
     const keyBytes = toBuf(key).slice(0, keyLen)
-    const keyWA = C.lib.WordArray.create(new Uint8Array(keyBytes))
+    /* B21: 不能把 Uint8Array 直接丢给 WordArray.create —— crypto-js 4.x 的 init 是
+       `t=this.words=t||[]; this.sigBytes=null!=e?e:4*t.length`，
+       会把 16 字节 key 当成 64 字节、words 里存的是原始字节值。必须走 hex 中转，
+       让 crypto-js 自己把 hex 解析成 words 并算对 sigBytes。 */
+    const toWA = (buf) => C.enc.Hex.parse(toBuf(buf).toString('hex'))
+    const keyWA = toWA(keyBytes)
     const cfg = { mode: C.mode[modeName.toUpperCase()] || C.mode.CBC, padding: C.pad.Pkcs7 }
-    if (iv && modeName !== 'ecb') cfg.iv = C.lib.WordArray.create(new Uint8Array(toBuf(iv)))
-    const dataWA = C.lib.WordArray.create(new Uint8Array(toBuf(buffer)))
+    if (iv && modeName !== 'ecb') cfg.iv = toWA(iv)
+    const dataWA = toWA(buffer)
     const enc = C.AES.encrypt(dataWA, keyWA, cfg)
     const out = Buf.from(enc.ciphertext.toString(C.enc.Base64), 'base64')
     return out
@@ -186,7 +197,14 @@
 
   class LxScript {
     constructor (id, code) {
-    this.logs = []   /* B24: 音源日志 */
+    this.logs = []
+    this.__pushLog = (lvl) => (...a) => {
+      try {
+        const line = '[' + lvl + '] ' + a.map((x) => (typeof x === 'string' ? x : JSON.stringify(x))).join(' ')
+        this.logs.push({ level: lvl, line: line.slice(0, 400), ts: Date.now() })
+        if (this.logs.length > 200) this.logs.shift()
+      } catch (e) { }
+    }   /* B24: 音源日志 */
       this.id = id
       this.code = code
       this.meta = parseMeta(code)
@@ -233,7 +251,8 @@
 
         const prevLx = globalThis.lx
         globalThis.lx = lx
-        globalThis.Buffer = Buf
+        const __prevBuffer = globalThis.Buffer
+      globalThis.Buffer = Buf
         globalThis.atob = atob
         globalThis.btoa = btoa
         try {
@@ -381,7 +400,9 @@
 
       /* ① 先单独试 fish：实测只有它给完整版，其他音源返回 30 秒试听
            strict match 偶发不中，重试 3 次（带不同音质档） */
-      const fishScript = this.scripts.get('fish')
+      /* B29: fish 之前无视 only 与 disabled，禁用后照跑、指定只用某源也返回 fish */
+      const __fishOk = (!only || only === 'fish') && !(this.disabled && this.disabled.has && this.disabled.has('fish'))
+      const fishScript = __fishOk ? this.scripts.get('fish') : null
       if (fishScript) {
         const qs = quality === 'flac' ? ['flac', '320k', '128k'] : ['320k', '128k', 'flac']
         for (let attempt = 0; attempt < 3; attempt++) {

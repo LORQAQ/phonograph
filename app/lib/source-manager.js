@@ -107,20 +107,26 @@ class SourceManager {
   }
 
   async loadAll () {
-    if (this.loading) return
-    this.loading = true
-    try {
-      if (!fs.existsSync(this.dir)) fs.mkdirSync(this.dir, { recursive: true })
-      const files = fs.readdirSync(this.dir).filter((f) => /\.js$/i.test(f) && !f.startsWith('.'))
-      const tasks = []
-      for (const f of files) tasks.push(this.loadOne(f))
-      // 并发加载，最多 4 个
-      const queue = tasks.slice()
-      const worker = async () => { while (queue.length) { await queue.shift() } }
-      await Promise.all([worker(), worker(), worker(), worker()])
-    } finally {
-      this.loading = false
-    }
+    /* B42: 进行中的加载共享给后来者（原来 `if (this.loading) return` 直接返回 undefined，
+       调用方以为加载完了，界面显示 0 个音源）；
+       同时队列里放文件名而不是已启动的 Promise，否则「最多 4 并发」形同虚设 */
+    if (this._loadingPromise) return this._loadingPromise
+    this._loadingPromise = (async () => {
+      try {
+        if (!fs.existsSync(this.dir)) fs.mkdirSync(this.dir, { recursive: true })
+        const queue = fs.readdirSync(this.dir).filter((f) => /\.js$/i.test(f) && !f.startsWith('.'))
+        const worker = async () => {
+          while (queue.length) {
+            const f = queue.shift()
+            try { await this.loadOne(f) } catch (e) { /* 单个失败不影响其他 */ }
+          }
+        }
+        await Promise.all([worker(), worker(), worker(), worker()])
+      } finally {
+        this._loadingPromise = null
+      }
+    })()
+    return this._loadingPromise
   }
 
   async loadOne (file) {
@@ -275,7 +281,7 @@ class SourceManager {
     const winner = await new Promise((resolve) => {
       let settled = false
       let pending = cands.length
-      const timer = setTimeout(() => { if (!settled) { settled = true; resolve(null) } }, 9000)
+      const timer = setTimeout(() => { if (!settled) { settled = true; resolve(null) } }, 12000)   /* B17: 原来 9000 < 5000(call)+6000(probe)=11000，慢源必被判死 */
       cands.forEach((c) => {
         task(c)().then((v) => {
           if (settled) return

@@ -1070,3 +1070,51 @@ button:focus,select:focus,a:focus{outline:none}
     transform: translate(-50%, -50%) scale(1.3);
   }
 }
+
+/* ==== BUG-REPORT-2 布局收尾 ==== */
+
+/* --- B71: 移动端 100vh 不随动态视口变化，软键盘/工具栏出现时底部被裁 --- */
+#app {
+  height: 100vh;
+  height: 100dvh;
+}
+@supports not (height: 100dvh) {
+  #app { height: 100vh; }
+}
+
+/* --- B68: 窗口矮的时候，正方形唱片区把歌词面板挤成 0 并被 overflow 裁掉 --- */
+.vinyl-zone {
+  max-height: min(42vh, 100%);
+}
+.deck-body {
+  min-height: 120px;
+}
+@media (max-height: 720px) {
+  .deck .plinth { padding: 10px 10px 8px; }
+  .deck-info h1 { font-size: 17px; }
+}
+
+/* --- B72: 进度条热区（::before ±14px）盖住了控制按钮顶部约 8px，
+       点播放/上一首/下一首的最上缘会变成跳进度 --- */
+@media (max-width: 860px) {
+  .progress-row {
+    pointer-events: none;
+  }
+  .progress {
+    pointer-events: auto;
+  }
+  .progress::before {
+    top: -6px !important;
+    bottom: -10px !important;
+  }
+}
+
+/* --- B69: 两条移动端规则打不中真实 DOM --- */
+/* enhanceSelect 把原生 select 包进 .dd，可见的是 .dd-btn；
+   #qualitySelect{display:none} 只作用在已被隐藏的 select 上，包装器不受影响。
+   JS 侧会给包装器打 data-for-sel，这里据此隐藏。 */
+@media (max-width: 860px) {
+  .dd[data-for-sel="qualitySelect"] {
+    display: none !important;
+  }
+}
