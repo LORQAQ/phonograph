@@ -93,13 +93,18 @@ function flushDb () {
     writeDbNow()
     dbDirty = false
     dbFirstDirtyAt = 0
+    dbRetry = 0
   } catch (e) {
     /* P0-2: 绝不能往外抛 —— flushDb 唯一的常规调用点是 setTimeout 回调，
        抛出去就是 uncaughtException，整个播放器会被一次写盘失败干掉。
        这里改成 3 秒后重试，自愈。 */
     dbDirty = true
     console.error('[db] 写盘失败，3 秒后重试:', e.message)
-    if (!saveTimer) saveTimer = setTimeout(flushDb, 3000)
+    /* P3-6: 指数退避，别每 3 秒刷日志 */
+    dbRetry = Math.min((dbRetry || 0) + 1, 6)
+    const __delay = Math.min(60000, 1000 * Math.pow(2, dbRetry))
+    if (dbRetry <= 2) console.error('[db] 写盘失败，' + Math.round(__delay / 1000) + 's 后重试:', e.message)
+    if (!saveTimer) saveTimer = setTimeout(flushDb, __delay)
   }
 }
 
@@ -931,9 +936,13 @@ const routes = {
          用户点保存会提交 {qqCookie: ''}，把真 Cookie 洗掉。
          这里做「空值不覆盖」。 */
       const patch = Object.assign({}, body)
-      if (patch.qqCookie === undefined || patch.qqCookie === '' || patch.qqCookie === null) {
+      /* P3-5: 显式清空用 clearQqCookie，空串仍然表示「不修改」 */
+      if (patch.clearQqCookie === true) {
+        patch.qqCookie = ''
+      } else if (patch.qqCookie === undefined || patch.qqCookie === '' || patch.qqCookie === null) {
         delete patch.qqCookie
       }
+      delete patch.clearQqCookie
       Object.assign(db.settings, patch)
       sourceManager.config = db.settings
       for (const e of sourceManager.entries.values()) e.enabled = sourceManager.enabledOf(e.id)
@@ -1112,7 +1121,11 @@ const server = http.createServer(async (req, res) => {
     }
     serveStatic(req, res, pathname)
   } catch (e) {
-    if (!res.headersSent) json(res, e.code || 500, { error: e.message || '服务器内部错误', attempts: e.attempts || undefined })
+    /* P2-1: socket 类错误的 code 是字符串（ECONNRESET/ETIMEDOUT），
+       直接传给 writeHead 会抛 Invalid status code，响应永远发不出去 */
+    const __n = Number(e && e.code)
+    const __code = (Number.isInteger(__n) && __n >= 400 && __n <= 599) ? __n : 500
+    if (!res.headersSent) json(res, __code, { error: e.message || '服务器内部错误', attempts: e.attempts || undefined })
     else { try { res.end() } catch (err) {} }
   }
 })

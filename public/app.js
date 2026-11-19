@@ -198,19 +198,27 @@ async function api (path, opts = {}) {
   if (window.__MOBILE__ && typeof window.mobileApi === 'function') {
     return await window.mobileApi(path, opts)
   }
-  const res = await fetch(path, {
-    method: opts.method || 'GET',
-    headers: { 'Content-Type': 'application/json' },
-    body: opts.body ? JSON.stringify(opts.body) : undefined,
-  })
-  let data = null
-  try { data = await res.json() } catch (e) { data = null }
-  if (!res.ok) {
-    const err = new Error((data && data.error) || ('请求失败 ' + res.status))
-    err.attempts = data && data.attempts
-    throw err
+  /* P2-9: 原来没有超时，服务端卡住（比如 gcid 拖 120 秒）界面就永远转圈 */
+  const __ac = typeof AbortController === 'function' ? new AbortController() : null
+  const __to = __ac ? setTimeout(() => { try { __ac.abort() } catch (e) { } }, opts.timeoutMs || 45000) : null
+  try {
+    const res = await fetch(path, {
+      method: opts.method || 'GET',
+      headers: { 'Content-Type': 'application/json' },
+      body: opts.body ? JSON.stringify(opts.body) : undefined,
+      signal: __ac ? __ac.signal : undefined,
+    })
+    let data = null
+    try { data = await res.json() } catch (e) { data = null }
+    if (!res.ok) {
+      const err = new Error((data && data.error) || ('请求失败 ' + res.status))
+      err.attempts = data && data.attempts
+      throw err
+    }
+    return data
+  } finally {
+    if (__to) clearTimeout(__to)
   }
-  return data
 }
 
 const LS = {
@@ -523,7 +531,12 @@ audio.addEventListener('loadedmetadata', syncLyricPlayBtn)
   })
   audio.addEventListener('playing', () => { state.failCount = 0 })
   audio.addEventListener('ended', () => { state.mode === 'single' ? replay() : playNext(true) })
-  audio.addEventListener('error', onAudioError)
+  /* P1-2: 切音质期间让全局的 onAudioError 让路，
+       否则两个 handler 会抢着改 audio.src —— 一个回退、一个换源重试、还可能 playNext */
+    audio.addEventListener('error', (e) => {
+      if (state.__qualitySwitching) return
+      onAudioError(e)
+    })
 
   document.addEventListener('click', (e) => {
     if (!e.target.closest('.ctx-menu')) hideContextMenu()
@@ -987,6 +1000,7 @@ async function onAudioError () {
 
 async function reloadCurrent (prevQualityArg) {
   if (!state.currentSong) return
+  state.__qualitySwitching = true         /* 切音质期间让全局 onAudioError 让路 */
   const token = state.playToken          /* B54: 切音质也要防切歌竞态 */
   const t = audio.currentTime
   const prevSrc = audio.src
@@ -1012,6 +1026,7 @@ async function reloadCurrent (prevQualityArg) {
     if (settled) return
     settled = true
     if (timer) { clearTimeout(timer); timer = null }
+    state.__qualitySwitching = false        /* 让全局 onAudioError 恢复工作 */
     state.quality = prevQuality
     saveSettings()
     rollbackUi()
@@ -1030,6 +1045,7 @@ async function reloadCurrent (prevQualityArg) {
   if (token !== state.playToken) {
     settled = true
     if (timer) clearTimeout(timer)
+    state.__qualitySwitching = false
     return
   }
 
@@ -1053,6 +1069,7 @@ async function reloadCurrent (prevQualityArg) {
     settled = true
     if (timer) { clearTimeout(timer); timer = null }
     cleanup()
+    state.__qualitySwitching = false        /* 让全局 onAudioError 恢复工作 */
     state.lastGoodQuality = state.quality     /* P1-6: 记住这次成功的音质 */
     audio.currentTime = t
     audio.play().catch(() => {})
