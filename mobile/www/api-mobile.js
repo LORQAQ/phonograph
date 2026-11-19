@@ -47,6 +47,12 @@
   function parsePlaylistUrl (raw) {
     const u = String(raw || '').trim()
     if (!u) return null
+    /* P2-7(手机端): 用户从酷狗 App 复制到的常常只有 gcid_xxx，没有 URL 外壳。
+       这一条必须放在最前面，否则会被后面的正则全部错过。 */
+    if (/^gcid_[a-z0-9]{8,}$/i.test(u)) return { platform: 'kg', id: u }
+    if (/^[a-z0-9]{14,}$/i.test(u) && /[a-z]/i.test(u)) return { platform: 'kg', id: u }
+    /* 纯数字且 4 位以上当网易云 id */
+    if (/^\d{4,}$/.test(u)) return { platform: 'wy', id: u }
     /* 网易云 */
     let m = u.match(/music\.163\.com[^#]*[#/]playlist\?[^#]*id=(\d+)/) || u.match(/[?&]id=(\d+)/)
     if (/music\.163\.com/.test(u) && m) return { platform: 'wy', id: m[1] }
@@ -458,8 +464,10 @@ function __kgMapSong (x) {
   let songName = String(x.songname || '').trim()
   if (!songName && fileName.includes(' - ')) songName = fileName.split(' - ').slice(1).join(' - ').trim()
   if (!songName) songName = fileName
-  if (remark && remark !== songName) songName = remark
   if (!songName) songName = '未知歌曲'
+  /* P1-3: remark 是任意备注（翻译名、《我是证人》电影主题曲……），
+     覆盖会把真歌名弄丢，搜原名搜不到。原名保留，备注进 alias。 */
+  const __alias = (remark && remark !== songName) ? remark : ''
 
   const durSec = x.duration ? Number(x.duration) : Math.round(Number(x.timelen || 0) / 1000)
 
@@ -476,6 +484,7 @@ function __kgMapSong (x) {
   return {
     id: hash, urlId: hash, lyricId: hash, picId: '',
     name: songName,
+    alias: __alias,
     singer: singer || '未知歌手',
     album: album,
     albumId: String(x.album_id || (x.albuminfo && x.albuminfo.id) || ''),
