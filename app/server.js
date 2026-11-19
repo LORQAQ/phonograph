@@ -89,14 +89,17 @@ function flushDb () {
   if (!dbDirty) return
   clearTimeout(saveTimer)
   saveTimer = null
-  dbDirty = false
-  dbFirstDirtyAt = 0
   try {
     writeDbNow()
+    dbDirty = false
+    dbFirstDirtyAt = 0
   } catch (e) {
+    /* P0-2: 绝不能往外抛 —— flushDb 唯一的常规调用点是 setTimeout 回调，
+       抛出去就是 uncaughtException，整个播放器会被一次写盘失败干掉。
+       这里改成 3 秒后重试，自愈。 */
     dbDirty = true
-    console.error('[db] 写盘失败', e.message)
-    throw e
+    console.error('[db] 写盘失败，3 秒后重试:', e.message)
+    if (!saveTimer) saveTimer = setTimeout(flushDb, 3000)
   }
 }
 
@@ -131,7 +134,7 @@ try { if (db.settings.qqCookie) qq.setCookie(db.settings.qqCookie) } catch (e) {
 const loadPromise = sourceManager.loadAll().then(() => {
   const ok = sourceManager.list().filter((s) => s.status === 'ok')
   console.log('[音源] 已加载 ' + sourceManager.list().length + ' 个脚本，可用 ' + ok.length + ' 个：' + ok.map((s) => s.name).join('、'))
-})
+}).catch((e) => { console.error('[音源] 加载失败:', e && e.message) })
 
 /* ---------------- 工具 ---------------- */
 const MIME = {
@@ -153,8 +156,22 @@ const SESSION_TOKEN = process.env.PHONOGRAPH_TOKEN || crypto.randomBytes(24).toS
 /* B7: 同源校验 —— 只接受本机 origin，防止恶意网页跨站 POST */
 function sameOrigin (req) {
   const o = req.headers.origin
-  if (!o) return true                       /* 同源 fetch / 无 Origin 的本地请求放行 */
-  return /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/.test(o)
+  /* 无 Origin 的本地请求（curl / 外壳）放行。
+     'null' 是沙箱 iframe / file:// 的 Origin —— 任意网页都能造出来，
+     放行等于把全部写接口暴露给任何网站，必须拒绝。 */
+  if (!o) return true
+  if (o === 'null') return false
+  let u = null
+  try { u = new URL(o) } catch (e) { return false }
+  /* 同主机同端口（含局域网 IP、[::1]）—— 手机浏览器访问时 Origin 就是 LAN 地址 */
+  const host = String(req.headers.host || '')
+  if (host && u.host === host) return true
+  if (/^(127\.0\.0\.1|localhost|\[::1\])$/.test(u.hostname)) return true
+  /* 开局域网模式时，本机所有网卡地址也放行 */
+  try {
+    if ((global.__LAN_IPS || []).includes(u.hostname)) return true
+  } catch (e) { }
+  return false
 }
 
 /* B7: 写接口守卫。needWrite=true 时强制 POST/PUT */
@@ -178,7 +195,12 @@ function guard (req, res, needWrite) {
 /* B6: 私有地址判定 */
 function isPrivateHost (h) {
   if (!h) return true
-  const host = String(h).toLowerCase()
+  /* B6: URL.hostname 对 IPv6 会带方括号（'[::1]'），net.isIPv6 判不出来；
+     还要处理 127.1（简写）、0x7f.0.0.1（十六进制）、::ffff:127.0.0.1（IPv4-mapped） */
+  let host = String(h).toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '')
+  if (/^::ffff:(\d+\.\d+\.\d+\.\d+)$/.test(host)) host = host.replace(/^::ffff:/, '')
+  if (/^0x[0-9a-f]+$/i.test(host)) { try { host = String(parseInt(host, 16)) } catch (e) { } }
+  if (/^\d+$/.test(host)) { try { host = '0.0.0.' + host } catch (e) { } }
   if (typeof net.isIPv4 === 'function' && net.isIPv4(host)) {
     const [a, b] = host.split('.').map(Number)
     return a === 10 || a === 127 || a === 0 ||
@@ -210,8 +232,11 @@ const PIC_HOST_ALLOW = [
 
 /* B39: 数字参数统一校验 */
 function intParam (raw, def, min, max) {
+  /* B39: Number('') === 0，会被 clamp 到 min；这里空串直接回默认值 */
+  if (raw === null || raw === undefined || String(raw).trim() === '') return def
   const n = Number(raw)
   if (!Number.isFinite(n)) return def
+  if (n === 0) return def
   return Math.min(max, Math.max(min, Math.trunc(n)))
 }
 
@@ -274,7 +299,9 @@ function proxyStream (req, res, targetUrl, opts = {}) {
       try { json(res, code, { error: msg }) } catch (e) { }
       return
     }
-    try { res.destroy() } catch (e) { }
+    /* B32: 头已发出时改不了状态码，但可以带上错误名，
+           让前端 onAudioError 能判定「已收部分数据后被重置」并换源重试 */
+    try { res.destroy(new Error('UPSTREAM_ABORTED')) } catch (e) { }
   }
 
   upstream = lib.get(u, { headers, timeout: 25000 }, (up) => {
@@ -376,6 +403,36 @@ function publicSettings () {
   return out
 }
 
+/* 等到「至少一个音源就绪」就返回，不等全部加载完。
+   fish 是 640KB 混淆代码，init 最长 12 秒；等全部会让冷启动点歌卡十几秒。 */
+async function waitForAnySource (platform, maxMs = 8000) {
+  /* P1-1: 必须按平台判。「任一源就绪」不等于「有源支持 wy」——
+     冷启动时先就绪的可能是只支持 tx 的源，此时放行会让
+     sourceManager.resolveUrl 直接抛「没有可用的音源脚本支持 wy」。 */
+  const deadline = Date.now() + maxMs
+  while (Date.now() < deadline) {
+    try {
+      const entries = sourceManager && sourceManager.entries
+      if (entries && entries.size > 0) {
+        for (const e of entries.values()) {
+          if (e.status === 'ok' && e.script) {
+            if (!platform) return true
+            const srcs = e.sources || (e.script && e.script.sources) || {}
+            if (srcs && srcs[platform]) return true
+          }
+        }
+      }
+    } catch (err) { }
+    await new Promise((r) => setTimeout(r, 150))
+  }
+  /* 兜底：仍没找到平台源时，再给 loadAll 最多 3 秒，别把「还在加载」报成「没有源」 */
+  await Promise.race([
+    loadPromise.catch(() => { }),
+    new Promise((r) => setTimeout(r, 3000)),
+  ])
+  return false
+}
+
 const routes = {
   async '/api/lan' () {
     const ips = global.__LAN_IPS || []
@@ -387,7 +444,13 @@ const routes = {
     }
   },
 
-  async '/api/health' () { return { ok: true, version: '1.0.0', pid: process.pid, platform: process.platform } },
+  async '/api/health' () {
+    return {
+      ok: true, version: '1.0.0', pid: process.pid, platform: process.platform,
+      /* B7: 外壳/前端可以拿这个 token 带 X-Phonograph-Token 头 */
+      token: SESSION_TOKEN,
+    }
+  },
 
   async '/api/shutdown' (req) {
     if (req.method !== 'POST') throw Object.assign(new Error('仅支持 POST'), { code: 405 })
@@ -418,12 +481,12 @@ const routes = {
     const platform = q.get('source') || 'wy'
     const quality = q.get('quality') || db.settings.quality || '320k'
     const cacheKey = platform + '|' + id + '|' + quality + '|' + (q.get('only') || '')
-    const hit = urlCache.get(cacheKey)
-    if (hit && hit.exp > Date.now()) return Object.assign({ id, source: platform, cached: true }, hit.value)
+    const hitVal = cacheGet(urlCache, cacheKey)
+    if (hitVal) return Object.assign({ id, source: platform, cached: true }, hitVal)
     /* B18: 已有同样的请求在飞，直接复用 */
     if (urlInflight.has(cacheKey)) return urlInflight.get(cacheKey)
     const job = (async () => {
-      await loadPromise.catch(() => {})
+      await waitForAnySource(platform)
     const info = await buildMusicInfo(platform, id, extraFromQuery(q))
     const { result, crossFrom } = await resolveWithCross({
       platform, info, quality,
@@ -436,8 +499,7 @@ const routes = {
       sourceId: result.sourceId, url: result.url, attempts: result.attempts,
       crossPlatform: crossFrom || undefined,
     }
-      urlCache.set(cacheKey, { value: payload, exp: Date.now() + 5 * 60e3 })
-      if (urlCache.size > 300) urlCache.delete(urlCache.keys().next().value)
+      cacheSet(urlCache, cacheKey, payload, 5 * 60e3, 300)
       return payload
     })().finally(() => urlInflight.delete(cacheKey))
     urlInflight.set(cacheKey, job)
@@ -462,11 +524,11 @@ const routes = {
     /* 与 /api/url 走同一条路径：等音源就绪 + 跨平台兜底 + 缓存 */
     const cacheKey = platform + '|' + id + '|' + quality + '|' + (q.get('only') || '')
     let target = ''
-    const hit = urlCache.get(cacheKey)
-    if (hit && hit.exp > Date.now()) {
-      target = hit.value.url
+    const hitVal = cacheGet(urlCache, cacheKey)
+    if (hitVal) {
+      target = hitVal.url
     } else {
-      await loadPromise.catch(() => { })
+      await waitForAnySource(platform)
       const info = await buildMusicInfo(platform, id, extraFromQuery(q))
       const { result } = await resolveWithCross({
         platform, info, quality,
@@ -480,7 +542,6 @@ const routes = {
           value: { id, source: platform, quality: result.quality, provider: result.provider, url: target },
           exp: Date.now() + 5 * 60e3,
         })
-        if (urlCache.size > 300) urlCache.delete(urlCache.keys().next().value)
       }
     }
 
@@ -491,6 +552,12 @@ const routes = {
 
   /* 下载目录：查询 / 设置 / 打开 */
   async '/api/download-dir' (req, q) {
+    /* P0-1: 这个接口同时承担「读」（GET，返回当前目录）和「写」（?set=/?open=）。
+       整条路径塞进 WRITE_PATHS 会让读取也 405，下载目录功能整块失效。
+       这里只对写操作要求 POST。 */
+    if ((q.get('set') || q.get('open')) && req.method !== 'POST' && req.method !== 'PUT') {
+      throw Object.assign(new Error('仅支持 POST'), { code: 405 })
+    }
     if (q.get('open')) {
       const dir = db.settings.downloadDir || defaultDownloadDir()
       let openErr = ''
@@ -623,7 +690,7 @@ const routes = {
       if (removed) break
     }
     if (!removed) throw Object.assign(new Error('文件不存在或删除失败'), { code: 404 })
-    return { ok: true, path: removed }
+    return { ok: true, name }    /* P1-3: 不回显绝对路径 */
   },
 
   async '/api/download' (req, q, res) {
@@ -726,7 +793,8 @@ const routes = {
       }
       /* B34: 两个临时文件都要清 —— 转码成功时 finalTmp 是 convOut，
          原来只删了 tmpFile，convOut 就永久留在 data/ 里（和下载文件一样大） */
-      for (const f of new Set([tmpFile, finalTmp])) {
+      /* B34: 转码失败时 finalTmp 还是 tmpFile，convOut 半成品会漏掉 */
+      for (const f of new Set([tmpFile, finalTmp, tmpFile + '.' + wantFmt])) {
         if (!f) continue
         try { if (path.resolve(f).startsWith(path.resolve(ROOT, 'data'))) fs.unlinkSync(f) } catch (e) { }
       }
@@ -752,8 +820,8 @@ const routes = {
 
   async '/api/discover' (req, q) {
     const platform = q.get('source') || 'wy'
-    const offset = Math.max(0, Number(q.get('offset') || 0))
-    const limit = Math.min(60, Math.max(6, Number(q.get('limit') || 30)))
+    const offset = intParam(q.get('offset'), 0, 0, 100000)    /* B39 */
+    const limit = intParam(q.get('limit'), 30, 6, 60)
     if (platform === 'tx') {
       const playlists = await qq.recommendPlaylists(offset, limit).catch(() => [])
       return { platform, offset, playlists, newSongs: [] }
@@ -859,7 +927,14 @@ const routes = {
 
   async '/api/settings' (req, q, res, body) {
     if (body) {
-      Object.assign(db.settings, body)
+      /* B51: 脱敏后前端拿不到 qqCookie，输入框永远是空的。
+         用户点保存会提交 {qqCookie: ''}，把真 Cookie 洗掉。
+         这里做「空值不覆盖」。 */
+      const patch = Object.assign({}, body)
+      if (patch.qqCookie === undefined || patch.qqCookie === '' || patch.qqCookie === null) {
+        delete patch.qqCookie
+      }
+      Object.assign(db.settings, patch)
       sourceManager.config = db.settings
       for (const e of sourceManager.entries.values()) e.enabled = sourceManager.enabledOf(e.id)
       /* QQ 音源登录信息即时生效 */
@@ -959,7 +1034,13 @@ function fetchText (url) {
 }
 
 function serveStatic (req, res, pathname) {
-  let rel = decodeURIComponent(pathname === '/' ? '/index.html' : pathname)
+  /* B33: 畸形百分号编码（/%E0%A4%A）会抛 URIError，落进外层 catch 变 500 */
+  let rel
+  try {
+    rel = decodeURIComponent(pathname === '/' ? '/index.html' : pathname)
+  } catch (e) {
+    return json(res, 400, { error: '非法请求路径' })
+  }
   const full = path.join(PUBLIC, rel.replace(/^\/+/, ''))
   /* S4: 用 path.relative 判断，避免 public2/ 这类兄弟前缀绕过 */
   const __rel = path.relative(PUBLIC, full)
@@ -996,13 +1077,29 @@ const server = http.createServer(async (req, res) => {
       const WRITE_PATHS = new Set([
         '/api/sources/toggle', '/api/sources/reload', '/api/sources/remove',
         '/api/sources/import', '/api/playlist', '/api/shutdown',
-        '/api/download-dir',
+        '/api/downloads/remove',
       ])
-      if (!sameOrigin(req)) {
-        return json(res, 403, { error: '来源不允许' })
-      }
-      if (WRITE_PATHS.has(pathname) && req.method !== 'POST' && req.method !== 'PUT') {
+      /* B7: 统一守卫（Origin + 可选 token）。token 由外壳通过 env 注入，
+         前端可以用 X-Phonograph-Token 带；不带也放行（本地单机场景） */
+      if (!guard(req, res, false)) return
+      /* B30: /api/playlist 的 preview / list 是只读的，GET 也要放行 */
+      const READ_ACTIONS = new Set(['preview', 'list', ''])
+      const isPlaylistRead = pathname === '/api/playlist' && READ_ACTIONS.has(u.searchParams.get('action') || '')
+      if (WRITE_PATHS.has(pathname) && req.method !== 'POST' && req.method !== 'PUT' && !isPlaylistRead) {
         return json(res, 405, { error: '仅支持 POST' })
+      }
+
+      /* P0-2: 写接口必须是 application/json。
+         浏览器发 text/plain 的 POST 属于 CORS「简单请求」，不发预检、请求真的会到本机；
+         要求 JSON 后，跨站要发 JSON 就必须过预检，而预检会因为我们不回 CORS 头而失败。 */
+      const isWrite = (req.method === 'POST' || req.method === 'PUT')
+      if (isWrite) {
+        const ct = String(req.headers['content-type'] || '').toLowerCase()
+        if (WRITE_PATHS.has(pathname) || pathname === '/api/settings' || pathname === '/api/download') {
+          if (!ct.startsWith('application/json')) {
+            return json(res, 415, { error: '写接口需要 application/json' })
+          }
+        }
       }
       let body = null
       if (req.method === 'POST' || req.method === 'PUT') {
@@ -1066,5 +1163,10 @@ function shutdownGracefully (code) {
 for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
   try { process.on(sig, () => shutdownGracefully(0)) } catch (e) { }
 }
+/* P0-2: 兜底，后台回调的意外异常不应该让整个播放器退出 */
+process.on('uncaughtException', (e) => {
+  try { console.error('[fatal] 未捕获异常:', e && e.stack ? e.stack : e) } catch (err) { }
+})
+
 process.on('exit', () => { try { flushDb() } catch (e) { } })
 module.exports = { server, db, sourceManager }

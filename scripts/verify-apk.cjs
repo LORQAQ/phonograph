@@ -70,7 +70,7 @@ const checks = [
   ['style.css 歌词放大', css.includes('歌词高亮放大')],
   ['style.css 进度条热区', css.includes('progress::before') || css.includes('.progress::before')],
   ['style.css 移动端返回栏', css.includes('nav-history') && css.includes('display: flex')],
-  ['api-mobile.js 酷狗 gcid 解析', apiMobile.includes('gcid_') && apiMobile.includes('listinfo')],
+  ['api-mobile.js 酷狗 gcid 全量拉取', apiMobile.includes('gcid_') && apiMobile.includes('kgGcidPlaylist') && apiMobile.includes('batch_decode')],
   ['api-mobile.js 酷狗取流', apiMobile.includes('getSongInfo')],
   ['api-mobile.js QQ ?id= 支持', apiMobile.includes('disstid')],
   ['api-mobile.js 歌单字段兼容', apiMobile.includes('body.listId || body.id')],

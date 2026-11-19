@@ -258,7 +258,24 @@
         try {
           // eslint-disable-next-line no-new-func
           const fn = new Function(this.code + '\n//# sourceURL=lx-source-' + this.id + '.js')
-          fn.call(globalThis)
+          /* P2: 把脚本的 console 接到实例的 logs 数组，否则音源面板的「日志」永远空白 */
+      const __prevConsole = globalThis.console
+      try {
+        if (this.__pushLog) {
+          globalThis.console = {
+            log: this.__pushLog('log'),
+            info: this.__pushLog('info'),
+            warn: this.__pushLog('warn'),
+            error: this.__pushLog('error'),
+            debug: this.__pushLog('debug'),
+          }
+        }
+      } catch (e) { }
+      try {
+        fn.call(globalThis)
+      } finally {
+        try { globalThis.console = __prevConsole } catch (e) { }
+      }
         } catch (e) {
           settled = true
           clearTimeout(timer)
@@ -266,7 +283,8 @@
           reject(new Error(this.error))
         }
         // 脚本同步初始化失败时恢复
-        setTimeout(() => { if (settled && globalThis.lx === lx) globalThis.lx = prevLx }, 100)
+        setTimeout(() => { if (settled && globalThis.lx === lx) globalThis.lx = prevLx
+        try { if (typeof __prevBuffer !== 'undefined') globalThis.Buffer = __prevBuffer } catch (e) { } }, 100)
       })
     }
 
@@ -388,14 +406,17 @@
       const PRIO = ['fish', 'kxh', 'dujia6', 'yuxi', 'changqing2', 'freelisten']
       const PRIO_KG = ['fish', 'kxh', 'dujia6', 'yuxi', 'changqing2', 'freelisten']
       const order = platform === 'kg' ? PRIO_KG : PRIO
-      const want = only ? [only].concat(order.filter((x) => x !== only)) : order
+      /* P1-B: only 指定时必须只试它，不能把其余音源也塞进竞速列表 */
+      const want = only ? [only] : order
 
       /* B9: 过滤被禁用的音源 */
       const isDisabled = (id) => this.disabled && this.disabled.has && this.disabled.has(id)
-      const list = want.filter((id) => !isDisabled(id)).map((id) => this.scripts.get(id)).filter(Boolean)
+      /* P1-B: 不回退到「全部脚本」。only 指定的源不可用就应该明确失败，
+         交给上层跨平台兜底，而不是静默换源假装成功。 */
+      const list = want.map((id) => this.scripts.get(id)).filter((e) => e && !isDisabled(e.id))
       if (!list.length) {
-        /* 平台不在优先列表里，全部试一遍 */
-        for (const s2 of this.scripts.values()) list.push(s2)
+        /* P1-B: 没有可用音源时明确返回 null，别偷偷换成全部脚本 */
+        return null
       }
 
       /* ① 先单独试 fish：实测只有它给完整版，其他音源返回 30 秒试听

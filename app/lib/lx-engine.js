@@ -134,7 +134,7 @@ function request (url, options = {}, callback = () => {}) {
           const MAX_OUT = { maxOutputLength: 16 * 1024 * 1024 }
           if (enc.includes('gzip')) buf = zlib.gunzipSync(buf, MAX_OUT)
           else if (enc.includes('deflate')) buf = zlib.inflateSync(buf, MAX_OUT)
-          else if (enc.includes('br')) buf = zlib.brotliDecompressSync(buf)
+          else if (enc.includes('br')) buf = zlib.brotliDecompressSync(buf, MAX_OUT)   /* B36: 补上解压上限 */
         } catch (e) { /* 忽略解压失败 */ }
         const text = buf.toString('utf8')
         let body = text

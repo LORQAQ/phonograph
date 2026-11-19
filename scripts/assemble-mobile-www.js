@@ -77,12 +77,13 @@ app = mustReplace(
 
 // 3.3 reloadCurrent 的移动端特判已经不需要了：
 //     public/app.js 里的 reloadCurrent 现在本身就是 `async` + `await streamSrc(...)`，
-//     两端共用同一份实现。这里保留一条断言，确保它没被改回同步 + /api/stream 的老写法。
-if (!/async function reloadCurrent \(\)/.test(app)) {
+//     两端共用同一份实现。这里保留断言，确保它没被改回同步 + /api/stream 的老写法。
+//     注意函数现在带参数（prevQualityArg），所以不能要求空括号。
+if (!/async function reloadCurrent\s*\(/.test(app)) {
   throw new Error('reloadCurrent 不再是 async（手机端会走 /api/stream 绝对路径而失败）')
 }
-if (!/await streamSrc\(state\.currentSong\)/.test(app)) {
-  throw new Error('reloadCurrent 里没有 await streamSrc(state.currentSong)（手机端音质切换会失败）')
+if (!/await streamSrc\(state\.currentSong/.test(app)) {
+  throw new Error('reloadCurrent 里没有 await streamSrc(state.currentSong...)（手机端音质切换会失败）')
 }
 
 fs.writeFileSync(path.join(WWW, 'app.js'), app, 'utf8')

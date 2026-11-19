@@ -281,7 +281,8 @@ class SourceManager {
     const winner = await new Promise((resolve) => {
       let settled = false
       let pending = cands.length
-      const timer = setTimeout(() => { if (!settled) { settled = true; resolve(null) } }, 12000)   /* B17: 原来 9000 < 5000(call)+6000(probe)=11000，慢源必被判死 */
+      const timer = setTimeout(() => { if (!settled) { settled = true; resolve(null) } }, 24000)   /* B17: tries 最多 2 档，每档 5000(call)+6000(probe)=11000，
+                                     两档最坏 22000。原来 12000 盖不住，会把「第一档超时、第二档能成」的慢源判死 */
       cands.forEach((c) => {
         task(c)().then((v) => {
           if (settled) return
