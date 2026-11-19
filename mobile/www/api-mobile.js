@@ -136,7 +136,14 @@
         /* M4: 正则用 /i 放行了大写，拼装也要大小写不敏感 */
         const gid = /^gcid_/i.test(id) ? ('gcid_' + String(id).replace(/^gcid_/i, '')) : ('gcid_' + id)
         const r = await kgGcidPlaylist(gid, 2000)
-        return { platform: 'kg', name: r.name || '酷狗歌单', cover: r.cover || '', songs: r.songs }
+        return {
+          platform: 'kg',
+          name: r.name || '酷狗歌单',
+          cover: r.cover || '',
+          songs: r.songs,
+          total: r.total,
+          truncated: !!r.truncated,
+        }
       }
       /* 酷狗歌单：实测 mobilecdn 的两个接口可用（需要 insecure 跳过证书校验） */
       const kgHeaders = {
@@ -357,7 +364,7 @@ async function __kgReq (url, opt) {
     headers: Object.assign({ 'User-Agent': o.ua || __KG_UA_IPHONE }, o.headers || {}),
     body: o.body,
     insecure: true,
-    timeout: 20000,
+    timeout: 40000,   /* M11: Java 侧 connect 12s + read 20s = 32s，JS 超时不能短于它 */
   })
   let j = null
   try { j = JSON.parse(String(r.body || '')) } catch (e) { }
