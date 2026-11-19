@@ -23,6 +23,7 @@ const state = {
   panelTab: 'list',
   platform: 'wy',
   quality: '320k',
+  lastGoodQuality: '',   /* 上一次取流成功的音质，切音质失败时回退用 */
   volume: 0.8,
   muted: false,
   mode: 'loop',
@@ -117,6 +118,7 @@ function navGo (delta) {
     else if (e.view === 'recommend') renderRecommendView()
     else if (e.view === 'leaderboard') renderLeaderboard()
     else if (e.view === 'recent') renderRecentView()
+    else if (e.view === 'downloads') renderDownloadsView()
     else if (e.view === 'search') {
       if (e.keyword) { $('#searchInput').value = e.keyword; state.keyword = e.keyword; doSearch() }
       else renderLibraryView()
@@ -131,10 +133,11 @@ function navGo (delta) {
 function enhanceSelect (sel) {
   if (!sel || sel.dataset.dd === '1') return
   sel.dataset.dd = '1'
-  /* B69: 给包装器打标记，好让 CSS 能按 select 的 id 隐藏 */
-  try { wrap.dataset.forSel = sel.id || '' } catch (e) { }
   const wrap = document.createElement('div')
   wrap.className = 'dd'
+  /* B69: 给包装器打标记，让 CSS 能按 select 的 id 隐藏。
+     注意必须放在 const wrap 之后 —— 放前面是 TDZ，会被 try/catch 静默吞掉。 */
+  wrap.dataset.forSel = sel.id || ''
   sel.parentNode.insertBefore(wrap, sel)
   wrap.appendChild(sel)
   sel.classList.add('dd-native')
@@ -345,8 +348,9 @@ function openDesktopLyric () {
     } else {
       const l = state.lyrics[state.lyricIndex]
       const n = state.lyrics[state.lyricIndex + 1]
-      window.NAPI.lyricShow(l ? l.text : '留声', n ? n.text : '')
-      toast('桌面歌词已开启，可拖动调整位置', 2600)
+/* M6: 消费 lyricShow 返回值，开启失败时别骗用户 */
+        const __lyOk = (function () { try { return window.NAPI.lyricShow(l ? l.text : '留声', n ? n.text : '') } catch (e) { return false } })()
+        if (__lyOk === false) { toast('桌面歌词打开失败（可在系统设置里允许「显示在其他应用上层」）', 3200); return }      toast('桌面歌词已开启，可拖动调整位置', 2600)
     }
     return
   }
@@ -369,8 +373,9 @@ async function boot () {
   updateModeIcon(); updateSpeedBtn()
   bindEvents()
   loadQueue()
-  await loadPlaylists()
-  await loadSources()
+  /* P2-1: 单个接口失败不能让整页变「初始化失败」 */
+  try { await loadPlaylists() } catch (e) { console.warn('[boot] loadPlaylists', e && e.message) }
+  try { await loadSources() } catch (e) { console.warn('[boot] loadSources', e && e.message) }
   renderLibraryView()
   nav.stack = [{ view: 'playlist' }]
   nav.index = 0
@@ -409,9 +414,10 @@ function bindEvents () {
     else if (state.view === 'search' && state.keyword) doSearch()
   }
   $('#qualitySelect').onchange = (e) => {
+    const __prevQ = state.quality          /* P1-6: 先存旧音质 */
     state.quality = e.target.value
     saveSettings()
-    if (state.currentSong) reloadCurrent()
+    if (state.currentSong) saveSettings(); reloadCurrent(__prevQ)
   }
 
   $$('.rail-item').forEach((b) => { b.onclick = () => switchView(b.dataset.view) })
@@ -736,6 +742,8 @@ async function checkPreviewAndSwitch (song, gotDuration) {
 
 async function startSong (song, only) {
   const token = ++state.playToken
+  /* P3-1: 进来先回收上一首的探测器，别等取流成功（失败路径会跳过回收） */
+  if (state.__pcCleanup) { try { state.__pcCleanup() } catch (e) { } state.__pcCleanup = null }
   const __songKey = String(song.id)
   if (!state.__lastSongKey || state.__lastSongKey !== __songKey) {
     state.__lastSongKey = __songKey
@@ -757,7 +765,14 @@ async function startSong (song, only) {
   if (token !== state.playToken) return
   /* B4/B52: 空值不要赋给 audio.src，并且必须给用户可见反馈 + 自动跳过 */
   if (!__srcUrl) {
+    /* P2-2: 取流失败要把播放态复位，否则按钮还是「暂停」图标、黑胶还在转 */
+    try { audio.pause() } catch (e) { }
     audio.removeAttribute('src')
+    try { audio.load() } catch (e) { }
+    state.playing = false
+    try { updatePlayButton() } catch (e) { }
+    try { const v = $('#vinyl'); if (v) v.classList.remove('playing') } catch (e) { }
+    try { const tn = $('#tonearm'); if (tn) tn.classList.remove('on') } catch (e) { }
     setSrc('解析失败')
     state.failCount = (state.failCount || 0) + 1
     if (state.failCount >= 3) {
@@ -769,10 +784,10 @@ async function startSong (song, only) {
     setTimeout(() => { if (token === state.playToken) playNext(true) }, 700)
     return
   }
+  state.failCount = 0    /* P2-2: 成功就清零，别和 onAudioError 的计数串 */
   audio.src = __srcUrl
 
   /* B53: 上一首的探测器必须回收，否则旧闭包读到新歌的 duration 会把播放抢回去 */
-  if (state.__pcCleanup) { try { state.__pcCleanup() } catch (e) { } state.__pcCleanup = null }
   let __pcChecked = false
   let __pcT1 = null
   let __pcT2 = null
@@ -829,7 +844,22 @@ async function startSong (song, only) {
 }
 
 function renderNowPlaying (song, resetBadge) {
-  if (!song) return
+  if (!song) {
+    /* B87: 清空队列时要真的把底栏清掉，不能直接 return */
+    const elName = $('#npName'); if (elName) elName.textContent = '未在播放'
+    const elSinger = $('#npSinger'); if (elSinger) elSinger.textContent = ''
+    const elTitle = $('#npTitle'); if (elTitle) elTitle.textContent = ''
+    const elArtist = $('#npArtist'); if (elArtist) elArtist.textContent = ''
+    const elCover = $('#coverImg'); if (elCover) elCover.removeAttribute('src')
+    const elNpCover = $('#npCover'); if (elNpCover) elNpCover.removeAttribute('src')
+    const elLyricCover = $('#lyricCover'); if (elLyricCover) elLyricCover.removeAttribute('src')
+    const elBg = $('#lyricBg'); if (elBg) elBg.style.backgroundImage = ''
+    $$('.song-list tbody tr').forEach((tr) => tr.classList.remove('playing'))
+    if (resetBadge) { try { setSrc('') } catch (e) { } }
+    try { paintProgress(0) } catch (e) { }
+    const elTotal = $('#totalTime'); if (elTotal) elTotal.textContent = '00:00'
+    return
+  }
   const cover = coverUrl(song)
   $('#coverImg').src = cover
   const npCover = $('#npCover')
@@ -933,7 +963,7 @@ async function onAudioError () {
     retryLock = true
     try {
       toast('这首歌换个音源重试…', 1600)
-      const next = await streamSrc(state.currentSong)
+      const next = await streamSrc(state.currentSong, '', true)
       if (next && next !== audio.src) {
         audio.src = next
         try { audio.load() } catch (e) {}
@@ -955,12 +985,16 @@ async function onAudioError () {
   setTimeout(() => playNext(true), 700)
 }
 
-async function reloadCurrent () {
+async function reloadCurrent (prevQualityArg) {
   if (!state.currentSong) return
   const token = state.playToken          /* B54: 切音质也要防切歌竞态 */
   const t = audio.currentTime
   const prevSrc = audio.src
-  const prevQuality = state.quality
+  /* P1-6: 旧音质从调用点传进来（onchange 已经先改了 state.quality） */
+  /* prevQualityArg 来自 onchange（已经先改了 state.quality）；
+       lastGoodQuality 是上一次成功的值；都没有时用设置里的默认值 */
+  const __fallbackQ = state.lastGoodQuality || (state.settings && state.settings.quality) || '320k'
+  const prevQuality = prevQualityArg || __fallbackQ || state.quality
   const wanted = state.quality
   toast('正在切换音质…', 1200)
 
@@ -1019,6 +1053,7 @@ async function reloadCurrent () {
     settled = true
     if (timer) { clearTimeout(timer); timer = null }
     cleanup()
+    state.lastGoodQuality = state.quality     /* P1-6: 记住这次成功的音质 */
     audio.currentTime = t
     audio.play().catch(() => {})
     toast('音质：' + qualityLabel(state.quality), 1400)
@@ -1110,10 +1145,13 @@ async function downloadSong (song) {
   toast('开始下载：' + song.name + '（' + (state.dlFormat === 'flac' ? 'FLAC' : 'MP3') + '）', 2200)
 
   /* 优先：后端直接存到「设置里的下载目录」，完全不弹窗 */
+  /* P1-3: r0 必须在 try 外声明，否则后面拿不到会变成 ReferenceError */
+  let r0 = null
+  let __dlErr = ''
   try {
     const sp0 = songParams(song)
     sp0.set('save', '1')
-    const r0 = await api('/api/download?' + sp0.toString())
+    r0 = await api('/api/download?' + sp0.toString())
     if (r0 && r0.ok) {
       toast('已保存：' + r0.name + '（' + (r0.size / 1048576).toFixed(1) + ' MB）', 3600)
       state.downloads.unshift({ name: song.name, singer: song.singer, quality: state.quality, ts: Date.now(), path: r0.path })
@@ -1121,24 +1159,24 @@ async function downloadSong (song) {
       LS.set('lx.downloads', state.downloads)
       state.downloading.delete(key)
       /* B86: renderList 全文件不存在，这里换成真实入口 */
-  try { if (state.view === 'downloads') renderDownloadsView() } catch (e) { }
+      try { if (state.view === 'downloads') renderDownloadsView() } catch (e) { }
       return
     }
+    __dlErr = (r0 && r0.error) || '保存失败'
   } catch (e) {
     /* 直存失败（比如目录没权限）→ 继续走下一步 */
+    __dlErr = e.message || String(e)
   }
 
-
   try {
-    const p = songParams(song)
     /* 直存失败：只提示，不再触发浏览器下载（那是弹窗来源） */
-    toast('下载失败：' + ((r0 && r0.error) || '未知错误'), 4200)
+    toast('下载失败：' + (__dlErr || (r0 && r0.error) || '未知错误'), 4200)
   } catch (e) {
     toast('下载失败：' + e.message, 3000)
   } finally {
     setTimeout(() => {
       state.downloading.delete(key)
-      try { renderList && renderList() } catch (e) {}
+      try { if (state.view === 'downloads') renderDownloadsView() } catch (e) { }
     }, 3000)
   }
 }
@@ -1279,10 +1317,13 @@ function showHistory () {
   $('#btnClearHistory').onclick = () => { state.history = []; LS.set('lx.history', []); box.classList.remove('show') }
 }
 
+/* P1-4: 去掉 loading 早退后必须用序号丢弃过期响应 */
+let searchSeq = 0
 async function doSearch (append = false) {
   const kw = $('#searchInput').value.trim()
   /* B66: 不再因 loading 丢弃新搜索 */
   if (!kw) return
+  const seq = ++searchSeq
   state.keyword = kw
   state.view = 'search'
   state.loading = true
@@ -1294,7 +1335,9 @@ async function doSearch (append = false) {
   if (!append) $('#panelList').innerHTML = skeletonList()
   try {
     const data = await api('/api/search?kw=' + encodeURIComponent(kw) + '&limit=50&page=' + state.page + '&source=' + state.platform)
-    state.results = append ? state.results.concat(data.list || []) : (data.list || [])
+    /* 迟到的响应直接丢弃，避免两次搜索互相覆盖 */
+  if (seq !== searchSeq) return
+  state.results = append ? state.results.concat(data.list || []) : (data.list || [])
     state.resultsTotal = data.total || state.results.length
     state.hasMore = state.results.length < state.resultsTotal && (data.list || []).length >= 20
     renderSearchResults()
@@ -2194,12 +2237,19 @@ function renderSettingsPane () {
   if ($('#qqCookieSave')) {
     api('/api/settings').then((s) => {
       const inp = $('#qqCookie') || { innerHTML: '', textContent: '', style: {}, value: '', classList: { add () {}, remove () {}, toggle () {} }, addEventListener () {}, appendChild () {}, querySelector () { return null }, querySelectorAll () { return [] }, setAttribute () {} }
-      if (inp && s && s.qqCookie) inp.value = s.qqCookie
+      /* B51: 服务端脱敏后不再返回 qqCookie，改成提示「已保存」；
+       输入框留空 = 不修改，避免用户一点保存就把真 Cookie 洗掉 */
+    if (inp) {
+      inp.value = ''
+      inp.placeholder = (s && s.qqCookieSet)
+        ? ('已保存（尾号 ' + (s.qqCookieTail || '') + '，留空则不修改）')
+        : '粘贴浏览器 Cookie'
+    }
     }).catch(() => {})
     $('#qqCookieSave').onclick = async () => {
       const v = ($('#qqCookie').value || '').trim()
       try {
-        await api('/api/settings', { method: 'POST', body: { qqCookie: v } })
+        await api('/api/settings', { method: 'POST', body: v ? { qqCookie: v } : {}    /* B51: 空串不提交 */ })
         toast(v ? 'QQ Cookie 已保存，可以加载 QQ 歌单了' : 'QQ Cookie 已清空', 2600)
       } catch (e) { toast('保存失败：' + e.message, 2600) }
     }
@@ -2239,6 +2289,17 @@ function renderSettingsPane () {
       }
     }
     bindWebviewMessage()
+    /* P2-3: 下载格式按钮之前只在 renderDownloadsView 里绑定，
+       不进下载页就点不动 */
+    $$('.dl-fmt').forEach((b) => {
+      b.classList.toggle('active', b.dataset.fmt === state.dlFormat)
+      b.onclick = () => {
+        state.dlFormat = b.dataset.fmt
+        saveSettings()
+        $$('.dl-fmt').forEach((x) => x.classList.toggle('active', x.dataset.fmt === state.dlFormat))
+        toast('下载格式：' + (state.dlFormat === 'flac' ? 'FLAC 无损' : 'MP3 320K'), 1600)
+      }
+    })
 
     /* B10: 之前这几组控件完全没有 onclick，点了没反应 */
     $$('[data-mode]').forEach((b) => {
@@ -2253,6 +2314,17 @@ function renderSettingsPane () {
     if (__rd) {
       __rd.onclick = async () => {
         if (!window.confirm('清空全部歌单与本地缓存？此操作不可恢复')) return
+      /* B10: 先掐断队列，否则 beforeunload → saveQueue 会把 lx.queue 原样写回去 */
+      try {
+        ++state.playToken
+        state.queue = []
+        state.index = -1
+        state.currentSong = null
+        state.playing = false
+        try { audio.pause() } catch (e) { }
+        try { audio.removeAttribute('src'); audio.load() } catch (e) { }
+        if (typeof saveQueue === 'function') saveQueue()
+      } catch (e) { }
         try {
           const arr = (state.playlists || []).filter((x) => x.id !== 'default')
           for (const pl of arr) {

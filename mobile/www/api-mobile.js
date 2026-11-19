@@ -123,69 +123,14 @@
 
     if (platform === 'kg') {
       /* gcid 走 HTML 解析 */
-      /* gcid_ 开头的歌单没有公开 API，只能从 songlist 页面的首屏数据里解析 */
-      if (/^gcid_/i.test(id) || /^[a-z0-9]{14,}$/i.test(id)) {
-        const html = await nativeHttp('https://m.kugou.com/songlist/' + (String(id).startsWith('gcid_') ? id : 'gcid_' + id) + '/', {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 Chrome/126.0.0.0 Mobile Safari/537.36',
-            Referer: 'https://m.kugou.com/',
-          },
-          insecure: true,
-        })
-        const text = String(html.body || '')
-        /* 歌单名在 window.$output.info.listinfo.name */
-        let plName = ''
-        let plCover = ''
-        const li = /"listinfo"\s*:\s*\{/.exec(text)
-        if (li) {
-          const seg = text.slice(li.index, li.index + 3000)
-          const nm = /"name"\s*:\s*"([^"]{1,80})"/.exec(seg)
-          if (nm) plName = nm[1]
-          const pc = /"pic"\s*:\s*"([^"]{10,200})"/.exec(seg)
-          if (pc) plCover = pc[1].replace(/\\\//g, '/').replace('{size}', '300')
-        }
-        if (!plName) {
-          const nm2 = /"specialname"\s*:\s*"([^"]{1,80})"/.exec(text)
-          if (nm2) plName = nm2[1]
-        }
-        const idx = text.indexOf('"songs":[')
-        if (idx < 0) throw new Error('这个酷狗歌单打不开（可能需要 App 内打开）')
-        /* 配平括号提取数组 */
-        let depth = 0; let start = -1; let inStr = false; let esc = false; let end = -1
-        for (let i = idx + 8; i < text.length; i++) {
-          const ch = text[i]
-          if (inStr) {
-            if (esc) { esc = false; continue }
-            if (ch === '\\') { esc = true; continue }
-            if (ch === '"') inStr = false
-            continue
-          }
-          if (ch === '"') { inStr = true; continue }
-          if (ch === '[') { if (depth === 0) start = i; depth++ }
-          else if (ch === ']') { depth--; if (depth === 0 && start >= 0) { end = i; break } }
-        }
-        if (start < 0 || end < 0) throw new Error('酷狗歌单数据解析失败')
-        const arrStr = text.slice(start, end + 1).replace(/\\\//g, '/')
-        let raw = null
-        try { raw = JSON.parse(arrStr) } catch (e) { throw new Error('酷狗歌单 JSON 解析失败') }
-        const songs = (raw || []).map((x) => {
-          const nm = String(x.name || '').trim()
-          const parts = nm.split(' - ')
-          const hash = String(x.hash || '')
-          if (!hash || !nm) return null
-          return {
-            id: hash,
-            source: 'kg',
-            name: parts.length > 1 ? parts.slice(1).join(' - ') : nm,
-            singer: parts.length > 1 ? parts[0] : '',
-            album: (x.albuuminfo && x.albuuminfo.name) || '',
-            albumId: String(x.album_id || ''),
-            durationText: msToText(Number(x.duration || 0) * 1000),
-            cover: String(x.cover || '').replace('{size}', '300'),
-          }
-        }).filter(Boolean)
-        if (!songs.length) throw new Error('酷狗歌单是空的')
-        return { platform: 'kg', name: plName || '酷狗歌单', cover: plCover, songs, skipped: 0 }
+      /* gcid_ 歌单：照洛雪的路子 —— batch_decode 解码 → info_v2 拿总数 → song_v2 按 300/页翻。
+         之前解析 m.kugou.com 的 HTML 只能拿到 SSR 首屏 10 首，?page=2 无效。 */
+      /* M15: 14 位以上纯数字是老的 specialid，不是 gcid */
+      if (/^gcid_/i.test(id) || (/^[a-z0-9]{14,}$/i.test(id) && !/^[0-9]+$/.test(id))) {
+        /* M4: 正则用 /i 放行了大写，拼装也要大小写不敏感 */
+        const gid = /^gcid_/i.test(id) ? ('gcid_' + String(id).replace(/^gcid_/i, '')) : ('gcid_' + id)
+        const r = await kgGcidPlaylist(gid, 2000)
+        return { platform: 'kg', name: r.name || '酷狗歌单', cover: r.cover || '', songs: r.songs }
       }
       /* 酷狗歌单：实测 mobilecdn 的两个接口可用（需要 insecure 跳过证书校验） */
       const kgHeaders = {
@@ -372,7 +317,241 @@
   }
 
   /* ---------- 路由 ---------- */
-  async function mobileApi (path, opts = {}) {
+  
+/* ================= 酷狗 gcid 歌单全量拉取 =================
+   照抄洛雪 lx-music-desktop 的思路：
+     ① POST t.kugou.com/v1/songlist/batch_decode      gcid → global_collection_id
+     ② GET  mobiles.kugou.com/api/v5/special/info_v2  拿 songcount
+     ③ GET  mobiles.kugou.com/api/v5/special/song_v2  按 300/页翻（失败退到 get_other_list_file）
+   签名：md5(KEY + sort(params.split('&')).join('') + body + KEY)
+     WEB_KEY = NVPh5oo715z5DIWAeQlhMDsWXXQV4hwt （appid=1058 / srcappid=2919）
+     AND_KEY = OIlwieks28dk2k092lksi2UIkp        （appid=1005）
+   POST 的 body 必须原样（无空格）拼进 md5。 */
+const __KG_WEB_KEY = 'NVPh5oo715z5DIWAeQlhMDsWXXQV4hwt'
+const __KG_AND_KEY = 'OIlwieks28dk2k092lksi2UIkp'
+const __KG_UA_IPHONE = 'Mozilla/5.0 (iPhone; CPU iPhone OS 11_0 like Mac OS X) AppleWebKit/604.1.38 (KHTML, like Gecko) Version/11.0 Mobile/15A372 Safari/604.1'
+const __KG_UA_ANDROID = 'Mozilla/5.0 (Linux; Android 10; HUAWEI HMA-AL00) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/83.0.4103.106 Mobile Safari/537.36'
+
+function __kgMd5 (str) {
+  /* M8: 别把计算异常也报成「缺库」，那样排查方向全错 */
+  if (!window.CryptoJS || !window.CryptoJS.MD5) throw new Error('缺少 CryptoJS.MD5，无法签名')
+  return window.CryptoJS.MD5(String(str)).toString()
+}
+
+function __kgSign (params, platform, body) {
+  const key = platform === 'web' ? __KG_WEB_KEY : __KG_AND_KEY
+  const sorted = String(params).split('&').sort()
+  return __kgMd5(key + sorted.join('') + (body || '') + key)
+}
+
+async function __kgReq (url, opt) {
+  const o = opt || {}
+  const r = await nativeHttp(url, {
+    method: o.method || 'GET',
+    headers: Object.assign({ 'User-Agent': o.ua || __KG_UA_IPHONE }, o.headers || {}),
+    body: o.body,
+    insecure: true,
+    timeout: 20000,
+  })
+  let j = null
+  try { j = JSON.parse(String(r.body || '')) } catch (e) { }
+  return { status: r.statusCode || 0, json: j, raw: r.body }
+}
+
+async function __kgDecodeGcid (gcid, n) {
+  /* M2: 与电脑端对齐 —— 20028 是限流不是永久失败。
+     写死的 clienttime/mid 会让重试永远是同一个签名请求，永远恢复不了。 */
+  const attempt = n || 0
+  const ct = String(Date.now() + attempt * 7919)
+  const params = 'dfid=-&appid=1005&mid=' + (attempt === 0 ? '0' : ct) +
+    '&clientver=20109&clienttime=' + ct + '&uuid=-'
+  const body = JSON.stringify({ ret_info: 1, data: [{ id: gcid, id_type: 2 }] })
+  const sign = __kgSign(params, 'android', body)
+  const r = await __kgReq('https://t.kugou.com/v1/songlist/batch_decode?' + params + '&signature=' + sign, {
+    method: 'POST', body, ua: __KG_UA_ANDROID, headers: { Referer: 'https://m.kugou.com/' },
+  })
+  const j = r.json
+  if (!j) throw new Error('gcid 解码失败：返回不是 JSON')
+  const code = Number(j.err_code || 0)
+  if (code === 20028 || code === 20010) {
+    if (attempt < 3) {
+      await new Promise((res) => setTimeout(res, 1200 * (attempt + 1)))
+      return __kgDecodeGcid(gcid, attempt + 1)
+    }
+    throw new Error('酷狗限流了，请等一两分钟再导入')
+  }
+  if (code !== 0) throw new Error('gcid 解码失败：err_code=' + code)
+  const item = j.data && j.data.list && j.data.list[0]
+  const gid = item && item.global_collection_id
+  if (!gid) throw new Error('gcid 解码失败：拿不到 global_collection_id')
+  return gid
+}
+
+async function __kgListInfo (globalId) {
+  const ct = String(Date.now())
+  const params = 'appid=1058&specialid=0&global_specialid=' + encodeURIComponent(globalId) +
+    '&format=jsonp&srcappid=2919&clientver=20000&clienttime=' + ct + '&mid=' + ct + '&uuid=' + ct + '&dfid=-'
+  const r = await __kgReq('https://mobiles.kugou.com/api/v5/special/info_v2?' + params + '&signature=' + __kgSign(params, 'web'), {
+    headers: { mid: ct, clienttime: ct, dfid: '-', Referer: 'https://m3ws.kugou.com/share/index.php' },
+  })
+  const d = r.json && r.json.data
+  if (!d) throw new Error('酷狗歌单信息获取失败')
+  return {
+    name: d.specialname || d.special_name || '酷狗歌单',
+    count: Number(d.songcount || d.song_count || 0),
+    cover: d.imgurl || d.img_url || '',
+    intro: d.intro || '',
+  }
+}
+
+async function __kgSongPage (globalId, page, pagesize) {
+  const ct = String(Date.now())
+  const params = 'appid=1058&global_specialid=' + encodeURIComponent(globalId) +
+    '&specialid=0&plat=0&version=8000&page=' + page + '&pagesize=' + pagesize +
+    '&srcappid=2919&clientver=20000&clienttime=' + ct + '&mid=' + ct + '&uuid=' + ct + '&dfid=-'
+  const r = await __kgReq('https://mobiles.kugou.com/api/v5/special/song_v2?' + params + '&signature=' + __kgSign(params, 'web'), {
+    headers: { mid: ct, clienttime: ct, dfid: '-', Referer: 'https://m3ws.kugou.com/share/index.php' },
+  })
+  const j = r.json
+  if (!j) throw new Error('酷狗歌单分页失败：返回不是 JSON')
+  if (j.errcode && j.errcode !== 0) {
+    if (j.errcode === 20028) throw Object.assign(new Error('酷狗限流'), { code: 20028 })
+    throw new Error('酷狗歌单分页失败：errcode=' + j.errcode)
+  }
+  const d = j.data || {}
+  return { total: Number(d.total || 0), list: d.info || [] }
+}
+
+async function __kgSongPageAlt (globalId, page, pagesize) {
+  const params = 'specialid=0&need_sort=1&module=CloudMusic&clientver=11409&pagesize=' + pagesize +
+    '&global_collection_id=' + encodeURIComponent(globalId) +
+    '&userid=0&page=' + page + '&type=1&area_code=1&appid=1005'
+  const r = await __kgReq('http://pubsongscdn.tx.kugou.com/v2/get_other_list_file?' + params + '&signature=' + __kgSign(params, 'android'), {
+    headers: { dfid: '-', 'User-Agent': 'Mozilla/5.0' },
+  })
+  const j = r.json
+  if (!j) throw new Error('酷狗歌单分页失败：返回不是 JSON')
+  if (j.error_code && j.error_code !== 0) throw new Error('酷狗歌单分页失败：error_code=' + j.error_code)
+  const d = j.data || {}
+  return { total: Number(d.count || 0), list: d.info || [] }
+}
+
+function __kgFmtTime (sec) {
+  const t = Math.max(0, Math.round(Number(sec) || 0))
+  if (!t) return ''    /* M10: 与其它平台的 msToText 保持一致，空时长不显示 0:00 */
+  return Math.floor(t / 60) + ':' + String(t % 60).padStart(2, '0')
+}
+
+function __kgMapSong (x) {
+  const hash = String(x.hash || x.FileHash || '')
+  if (!hash) return null
+  const fileName = String(x.filename || x.name || '').trim()
+  const remark = String(x.remark || '').trim()
+
+  let singer = ''
+  if (Array.isArray(x.singerinfo) && x.singerinfo.length) {
+    singer = x.singerinfo.map((s) => (s && s.name) || '').filter(Boolean).join('、')
+  }
+  if (!singer && x.singername) singer = String(x.singername).trim()
+  if (!singer && fileName.includes(' - ')) singer = fileName.split(' - ')[0].trim()
+
+  let songName = String(x.songname || '').trim()
+  if (!songName && fileName.includes(' - ')) songName = fileName.split(' - ').slice(1).join(' - ').trim()
+  if (!songName) songName = fileName
+  if (remark && remark !== songName) songName = remark
+  if (!songName) songName = '未知歌曲'
+
+  const durSec = x.duration ? Number(x.duration) : Math.round(Number(x.timelen || 0) / 1000)
+
+  let cover = ''
+  const tp = x.trans_param || {}
+  if (tp.union_cover) cover = tp.union_cover
+  else if (tp.union_cover_od) cover = tp.union_cover_od
+  else if (typeof x.cover === 'string') cover = x.cover
+  else if (Array.isArray(x.cover) && x.cover.length) cover = x.cover[0]
+  if (cover) cover = String(cover).replace('{size}', '300')
+
+  const album = (x.albuminfo && x.albuminfo.name) || String(x.album_name || '')
+
+  return {
+    id: hash, urlId: hash, lyricId: hash, picId: '',
+    name: songName,
+    singer: singer || '未知歌手',
+    album: album,
+    albumId: String(x.album_id || (x.albuminfo && x.albuminfo.id) || ''),
+    cover: cover,
+    duration: durSec * 1000,
+    durationText: __kgFmtTime(durSec),
+    fee: (x.feetype || x.pay_type) ? 1 : 0,
+    source: 'kg',
+    raw: {
+      hash, songmid: hash, name: songName, singer,
+      albumId: String(x.album_id || ''),
+      audioId: x.audio_id || 0,
+      albumAudioId: x.album_audio_id || 0,
+      _types: { kg: true }, source: 'kg',
+    },
+  }
+}
+
+async function kgGcidPlaylist (gcid, maxSongs) {
+  const limitTotal = maxSongs || 2000
+  const pageSize = 300
+  const globalId = await __kgDecodeGcid(gcid)
+
+  let meta = { name: '酷狗歌单', count: 0, cover: '', intro: '' }
+  try { meta = await __kgListInfo(globalId) } catch (e) { }
+
+  const all = []
+  const seen = new Set()
+  let total = meta.count || 0
+  let usedAlt = false
+
+  for (let page = 1; page <= 100 && all.length < limitTotal; page++) {
+    let r = null
+    try {
+      r = await __kgSongPage(globalId, page, pageSize)
+    } catch (e) {
+      if (!usedAlt) {
+        usedAlt = true
+        try { r = await __kgSongPageAlt(globalId, page, pageSize) } catch (e2) {
+          if (page === 1) throw new Error('酷狗歌单拉取失败：' + e2.message)
+          break
+        }
+      } else if (page === 1) {
+        throw new Error('酷狗歌单拉取失败：' + e.message)
+      } else { break }
+    }
+    if (!r) break
+    if (r.total > total) total = r.total
+    const list = r.list || []
+    if (!list.length) break
+    for (const x of list) {
+      const sm = __kgMapSong(x)
+      if (!sm || seen.has(sm.id)) continue
+      seen.add(sm.id)
+      all.push(sm)
+      if (all.length >= limitTotal) break
+    }
+    if (total && all.length >= total) break
+    if (list.length < pageSize) break
+    await new Promise((r2) => setTimeout(r2, 200))
+  }
+
+  if (!all.length) throw new Error('酷狗歌单是空的')
+  /* M3: 中途被限流截断时要告诉上层，别让用户以为导全了 */
+  return {
+    platform: 'kg',
+    name: meta.name || '酷狗歌单',
+    cover: meta.cover || '',
+    songs: all,
+    total: total || all.length,
+    got: all.length,
+    truncated: (total || 0) > all.length,
+  }
+}
+
+async function mobileApi (path, opts = {}) {
     const u = new URL(path, 'http://m.local')
     const p = u.pathname
     const q = u.searchParams
@@ -404,9 +583,9 @@
       const source = q.get('source') || 'wy'
       const offset = Math.max(0, Number(q.get('offset') || 0))
       const limit = Math.min(60, Math.max(6, Number(q.get('limit') || 30)))
-      if (source === 'tx') return { platform: source, offset, playlists: await NET_TX.recommendPlaylists(offset, limit), newSongs: (source === 'wy' && NET_WY.newSongs) ? await NET_WY.newSongs(10).catch(() => []) : [] }
-      if (source === 'kg') return { platform: source, offset, playlists: await NET_KG.recommendPlaylists(offset, limit), newSongs: (source === 'wy' && NET_WY.newSongs) ? await NET_WY.newSongs(10).catch(() => []) : [] }
-      return { platform: source, offset, playlists: await NET_WY.recommendPlaylists(offset, limit), newSongs: (source === 'wy' && NET_WY.newSongs) ? await NET_WY.newSongs(10).catch(() => []) : [] }
+      if (source === 'tx') return { platform: source, offset, playlists: await NET_TX.recommendPlaylists(offset, limit), newSongs: NET_WY.newSongs ? await NET_WY.newSongs(10).catch(() => []) : [] }
+      if (source === 'kg') return { platform: source, offset, playlists: await NET_KG.recommendPlaylists(offset, limit), newSongs: NET_WY.newSongs ? await NET_WY.newSongs(10).catch(() => []) : [] }
+      return { platform: source, offset, playlists: await NET_WY.recommendPlaylists(offset, limit), newSongs: NET_WY.newSongs ? await NET_WY.newSongs(10).catch(() => []) : [] }
     }
 
     if (p === '/api/lyric') {
@@ -648,6 +827,16 @@
           return { list: await M.addCode(id, code, body.name) }
         }
       }
+      /* B73: 冷启动直接进设置→音源时，脚本还没加载完，会显示 0/0。
+         这里确保至少触发一次加载（ensureScripts 内部有去重，不会重复跑）。 */
+      try {
+        if (typeof ensureScripts === 'function') {
+          await Promise.race([
+            ensureScripts(),
+            new Promise((r) => setTimeout(r, 6000)),
+          ])
+        }
+      } catch (e) { }
       return { list: M ? M.list() : [], defaultOrder: [] }
     }
 
@@ -736,12 +925,28 @@
     try {
       const u = new URL(path, 'http://m.local')
       const q = u.searchParams
-      key = [q.get('id'), q.get('source') || 'wy', q.get('quality') || '320k', q.get('only') || ''].join('|')
+      /* 缓存 key 必须包含所有参与取流的参数。
+         只取 4 个字段会出两个 bug：
+         1) format 没进 key → 播放缓存的 mp3 直链会被 FLAC 下载命中（下到 mp3 但文件名 .flac）
+         2) mediaMid/name/singer 没进 key → QQ 同 songmid 不同文件、跨平台兜底搜词不同也会被合并 */
+      key = [
+        q.get('id'), q.get('source') || 'wy', q.get('quality') || '320k',
+        q.get('format') || '', q.get('only') || '',
+        q.get('mediaMid') || '', q.get('name') || '', q.get('singer') || '',
+      ].join('|')
     } catch (e) {
       return __mobileApiRaw(path, opts)
     }
-    const hit = __urlCache.get(key)
-    if (hit && hit.exp > Date.now()) return Promise.resolve(hit.value)
+    /* force / noCache：失败重试时必须能绕过缓存 */
+    const __force = !!(opts && (opts.force || opts.noCache))
+    if (!__force) {
+      const hit = __urlCache.get(key)
+      if (hit && hit.exp > Date.now()) {
+        /* 返回浅拷贝：调用方改 d.url 不会污染全局缓存 */
+        return Promise.resolve(Object.assign({}, hit.value))
+      }
+    }
+    if (__force) { __urlCache.delete(key); __urlInflight.delete(key) }
     if (__urlInflight.has(key)) return __urlInflight.get(key)
     const job = __mobileApiRaw(path, opts).then((r) => {
       if (r && r.url) {
