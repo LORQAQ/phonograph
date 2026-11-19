@@ -187,6 +187,89 @@ function enhanceSelect (sel) {
   sync()
 }
 
+/* ================= 版本与检查更新 ================= */
+const APP_VERSION = '1.0.25'
+const GH_OWNER = 'LORQAQ'
+const GH_REPO = 'phonograph'
+const GH_RELEASES = 'https://github.com/' + GH_OWNER + '/' + GH_REPO + '/releases/latest'
+
+/* 在系统浏览器里打开链接：桌面端走外壳，手机端走原生，浏览器里 fallback 到 window.open */
+function openExternal (url) {
+  if (!url) return
+  try {
+    if (window.__MOBILE__ && window.NAPI && typeof window.NAPI.openUrl === 'function') {
+      if (window.NAPI.openUrl(url)) return
+    }
+    if (window.chrome && window.chrome.webview && window.chrome.webview.postMessage) {
+      window.chrome.webview.postMessage('openUrl:' + url)
+      return
+    }
+    if (window.open) { window.open(url, '_blank'); return }
+  } catch (e) { }
+  try { location.href = url } catch (e) { }
+}
+
+/* 版本比较：1.0.24 vs 1.0.9 要按数字比，不能按字符串 */
+function cmpVersion (a, b) {
+  const pa = String(a || '').replace(/^v/i, '').split('.').map((x) => parseInt(x, 10) || 0)
+  const pb = String(b || '').replace(/^v/i, '').split('.').map((x) => parseInt(x, 10) || 0)
+  const n = Math.max(pa.length, pb.length)
+  for (let i = 0; i < n; i++) {
+    const x = pa[i] || 0
+    const y = pb[i] || 0
+    if (x > y) return 1
+    if (x < y) return -1
+  }
+  return 0
+}
+
+let __updateChecking = false
+async function checkUpdate () {
+  if (__updateChecking) return
+  __updateChecking = true
+  const btn = $('#btnCheckUpdate')
+  const oldText = btn ? btn.textContent : ''
+  if (btn) { btn.textContent = '检查中…'; btn.disabled = true }
+  try {
+    const ac = typeof AbortController === 'function' ? new AbortController() : null
+    const to = ac ? setTimeout(() => { try { ac.abort() } catch (e) { } }, 15000) : null
+    let data = null
+    try {
+      const res = await fetch('https://api.github.com/repos/' + GH_OWNER + '/' + GH_REPO + '/releases/latest', {
+        headers: { Accept: 'application/vnd.github+json' },
+        signal: ac ? ac.signal : undefined,
+      })
+      if (!res.ok) throw new Error('GitHub 返回 ' + res.status)
+      data = await res.json()
+    } finally {
+      if (to) clearTimeout(to)
+    }
+    const latest = (data && data.tag_name) || ''
+    const url = (data && data.html_url) || GH_RELEASES
+    if (!latest) throw new Error('拿不到版本号')
+
+    if (cmpVersion(latest, APP_VERSION) > 0) {
+      const go = window.confirm(
+        '发现新版本 ' + latest + '（当前 v' + APP_VERSION + '）\n\n' +
+        ((data && data.name) || '') + '\n\n' +
+        '要现在打开下载页吗？'
+      )
+      if (go) openExternal(url)
+      else toast('已跳过，可随时在设置里再检查', 2200)
+    } else {
+      toast('已是最新版本 v' + APP_VERSION, 2200)
+    }
+  } catch (e) {
+    const m = String((e && e.message) || e)
+    if (/abort/i.test(m)) toast('检查更新超时，请检查网络', 2600)
+    else if (/Failed to fetch|NetworkError|Load failed/i.test(m)) toast('连不上 GitHub，请检查网络或代理', 3000)
+    else toast('检查更新失败：' + m, 3000)
+  } finally {
+    __updateChecking = false
+    if (btn) { btn.textContent = oldText || '检查更新'; btn.disabled = false }
+  }
+}
+
 function toast (msg, ms = 2400) {  const el = document.createElement('div')
   el.className = 'toast'
   el.textContent = msg
@@ -2246,6 +2329,7 @@ function renderSettingsPane () {
           <button class="btn-ghost" data-sleep="0">取消</button>
         </div></div>
       <div class="form-row"><label>桌面歌词</label><button class="btn-ghost" id="setDesktop">打开独立窗口</button></div>
+      <div class="form-row"><label>检查更新（当前 v${APP_VERSION}）</label><button class="btn-ghost" id="btnCheckUpdate">检查更新</button></div>
       <div class="form-row"><label>清空本地数据</label><button class="btn-ghost btn-danger" id="btnResetData">清空歌单与缓存</button></div>
     </div>
     <h2 style="font-family:var(--serif);font-size:14px;margin:18px 0 8px">最近下载</h2>
@@ -2344,6 +2428,8 @@ function renderSettingsPane () {
     })
     const __sd = $('#setDesktop')
     if (__sd) __sd.onclick = () => { try { openDesktopLyric() } catch (e) { } }
+    const __cu = $('#btnCheckUpdate')
+    if (__cu) __cu.onclick = () => { try { checkUpdate() } catch (e) { } }
     const __rd = $('#btnResetData')
     if (__rd) {
       __rd.onclick = async () => {
