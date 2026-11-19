@@ -1262,8 +1262,7 @@ button:focus,select:focus,a:focus{outline:none}
   min-height:0;
   overflow-y:auto;
 }
-/* 歌词字号在窄屏下略微收一点，多显示几行 */
-.lyric-roll .ll{font-size:13px;line-height:1.7}
+/* 歌词字号在窄屏下略微收一点（必须放媒体查询里，否则桌面端也被压小） */
 
 /* 4) 更矮的窗口（比如 617 高）再压黑胶 */
 @media (max-height:720px){
@@ -1287,11 +1286,11 @@ button:focus,select:focus,a:focus{outline:none}
      1) 把旋转元素提到独立合成层，避免每帧重绘
      2) 旋转期间锁住 layout，别让内容和高度互相触发 */
 
-/* 注意：这里曾经写过 `/* 已撤销：.vinyl-zone > * { width:100%; height:100%; aspect-ratio:1/1 }
-   父容器 width:100% + max-height 生效时是矩形，子元素跟着拉成椭圆。
-   保持唱片为正圆只能靠 .vinyl-zone 自身的 aspect-ratio。 */`，
-   它会把子元素按父容器的宽高比拉伸 —— 父容器不是正方形时，唱片就被拉成椭圆还溢出去。
-   绝对不要在 .vinyl-zone 的子元素上同时写 width/height 100% 和 aspect-ratio。 */
+/* ====== 历史记录（勿恢复）======
+   曾经在 .vinyl-zone > * 上写过 width:100%; height:100%; aspect-ratio:1/1。
+   父容器一旦不是正方形（比如被 max-height 压过），子元素就跟着拉成椭圆。
+   保持正圆只能靠 .vinyl-zone 自身的 aspect-ratio，不要在子元素上干预。
+   ================================ */
 
 /* 旋转元素：独立层 + 不回流 */
 .vinyl,
@@ -1303,7 +1302,6 @@ button:focus,select:focus,a:focus{outline:none}
   transform-origin:50% 50%;
 }
 .vinyl.playing{
-  animation:spin 8s linear infinite;
   contain:layout style;
 }
 
@@ -1327,31 +1325,29 @@ button:focus,select:focus,a:focus{outline:none}
   margin:0 auto;
   width:100%;
   /* 关键：宽度上限跟着视口高度走，宽高永远同步 */
-  max-width:min(100%, 34vh);
+  max-width:clamp(160px, 34vh, 340px);
   aspect-ratio:1/1;
   height:auto;
   max-height:none;
 }
 /* 宽屏时用高度限制反推宽度（竖屏/窄屏走上面的 vh 就够了） */
 @media (min-width:861px){
-  .vinyl-zone{
-    max-width:min(100%, 34vh, 340px);
-  }
+  /* merged */
 }
 @media (max-height:720px){
-  .vinyl-zone{max-width:min(100%, 26vh)}
+  /* merged */
 }
 @media (max-height:640px){
-  .vinyl-zone{max-width:min(100%, 22vh)}
+  /* merged */
 }
 @media (max-width:1180px){
-  .vinyl-zone{max-width:min(100%, 30vh)}
+  /* merged */
 }
 @media (max-width:980px){
-  .vinyl-zone{max-width:min(100%, 28vh)}
+  /* merged */
 }
 @media (max-width:860px){
-  .vinyl-zone{max-width:min(100%, 26vh)}
+  /* merged */
 }
 
 /* 里面的唱片/纹路/标签撑满这个正方形，不要再各自写 aspect-ratio */
@@ -1360,4 +1356,47 @@ button:focus,select:focus,a:focus{outline:none}
 .vinyl-zone .tonearm{
   max-width:100%;
   /* 不要写 max-height:100% —— 父容器一旦不是正方形就会把唱片压扁 */
+}
+
+/* ==== 唱片尺寸：clamp 统一下限 ==== */
+
+/* 之前 6 条 max-width:min(100%,Nvh) 特异性相同，后写的无条件覆盖前面的，
+   导致「窗口越窄唱片越大」（1181×600 → 132px，1180×600 → 180px）。
+   改成所有档位共用一个 clamp 下限，横向和纵向同时受约束。 */
+
+.vinyl-zone{
+  width:100%;
+  max-width:clamp(160px, 34vh, 340px);
+  aspect-ratio:1/1;
+  height:auto;
+  max-height:none;
+  margin:0 auto;
+}
+@media (max-width:1180px){
+  .vinyl-zone{max-width:clamp(150px, 30vh, 340px)}
+}
+@media (max-width:980px){
+  .vinyl-zone{max-width:clamp(140px, 28vh, 320px)}
+}
+@media (max-width:860px){
+  .vinyl-zone{max-width:clamp(130px, 26vh, 300px)}
+}
+/* 高度档只在下限上生效，不整条覆盖宽度档 */
+@media (max-height:720px){
+  .vinyl-zone{max-width:clamp(150px, 26vh, 300px)}
+}
+@media (max-height:640px) and (min-width:981px){
+  .vinyl-zone{max-width:clamp(150px, 26vh, 300px)}
+}
+@media (max-height:570px){
+  /* 矮窗兜底：整列可滚，别让 overflow:hidden 把歌词裁掉 */
+  .deck{overflow-y:auto}
+  #panelLyric.deck-body,
+  .deck-body.lyric-body{min-height:96px}
+  .deck .deck-plate{display:none}
+}
+
+/* lyric-narrow：窄屏才收字号，桌面保持 clamp(12px,1vw,14.5px) */
+@media (max-width:1180px), (max-height:720px){
+  .lyric-roll .ll{font-size:13px;line-height:1.7}
 }

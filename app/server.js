@@ -203,8 +203,17 @@ function isPrivateHost (h) {
   /* B6: URL.hostname 对 IPv6 会带方括号（'[::1]'），net.isIPv6 判不出来；
      还要处理 127.1（简写）、0x7f.0.0.1（十六进制）、::ffff:127.0.0.1（IPv4-mapped） */
   let host = String(h).toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '')
-  /* IPv4-mapped */
-  if (/^::ffff:(\d+\.\d+\.\d+\.\d+)$/.test(host)) host = host.replace(/^::ffff:/, '')
+  /* IPv4-mapped：点分形式 ::ffff:a.b.c.d 和十六进制形式 ::ffff:7f00:1 都要认 */
+  if (/^::ffff:(\d+\.\d+\.\d+\.\d+)$/.test(host)) {
+    host = host.replace(/^::ffff:/, '')
+  } else {
+    const mv = host.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/)
+    if (mv) {
+      const hi = parseInt(mv[1], 16)
+      const lo = parseInt(mv[2], 16)
+      host = [(hi >> 8) & 255, hi & 255, (lo >> 8) & 255, lo & 255].join('.')
+    }
+  }
 
   /* P3-2: 浏览器的 URL 会把 127.1 / 0x7f.0.0.1 / 2130706433 / 0177.0.0.1
      都当合法 IP，但 net.isIPv4 只认标准四段十进制。这里先把各种写法归一。
@@ -490,7 +499,7 @@ const routes = {
 
   async '/api/health' () {
     return {
-      ok: true, version: '1.0.26', pid: process.pid, platform: process.platform,
+      ok: true, version: '1.0.27', pid: process.pid, platform: process.platform,
       /* B7: 外壳/前端可以拿这个 token 带 X-Phonograph-Token 头 */
       token: SESSION_TOKEN,
     }
@@ -1011,7 +1020,15 @@ const routes = {
       if (!url) throw Object.assign(new Error('缺少歌单链接'), { code: 400 })
       const r = await importPlaylist(url)
       return {
-        preview: { name: r.name, count: (r.songs || []).length, platform: r.platform, cover: r.cover || '' },
+        preview: {
+          name: r.name,
+          count: (r.songs || []).length,
+          total: r.total,
+          truncated: !!r.truncated,
+          timedOut: !!r.timedOut,
+          platform: r.platform,
+          cover: r.cover || '',
+        },
         songs: r.songs || [],
       }
     }
@@ -1028,7 +1045,7 @@ const routes = {
       }
       db.playlists.push(pl)
       saveDb()
-      return { playlists: db.playlists, imported: { id: pl.id, name: pl.name, count: pl.songs.length, platform: r.platform } }
+      return { playlists: db.playlists, imported: { id: pl.id, name: pl.name, count: pl.songs.length, total: r.total, truncated: !!r.truncated, timedOut: !!r.timedOut, skipped: r.skipped || 0, platform: r.platform } }
     }
     if (action === 'create') {
       const p = { id: 'pl' + Date.now(), name: (b && b.name) || '新建歌单', songs: [] }

@@ -15,7 +15,8 @@ const cs = fs.readFileSync('scripts/NativeShell.cs', 'utf8')
 const java = fs.readFileSync('../apk-build/app/src/com/phonograph/player/NapiBridge.java', 'utf8')
 
 console.log('【1】前端实现')
-s.includes("const APP_VERSION = '1.0.24'") ? ok('APP_VERSION 常量') : bad('APP_VERSION', '缺')
+const ver = (s.match(/const APP_VERSION = '([^']+)'/) || [])[1]
+ver ? ok('APP_VERSION 常量 = ' + ver) : bad('APP_VERSION', '缺')
 s.includes('async function checkUpdate') ? ok('checkUpdate 函数') : bad('checkUpdate', '缺')
 s.includes('function openExternal') ? ok('openExternal 函数') : bad('openExternal', '缺')
 s.includes('function cmpVersion') ? ok('cmpVersion 函数') : bad('cmpVersion', '缺')

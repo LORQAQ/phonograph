@@ -5,7 +5,7 @@ const path = require('node:path')
 const { execSync } = require('node:child_process')
 
 const ROOT = path.resolve(__dirname, '..', '..')
-const EXE = path.join(ROOT, 'lx-music-clone', '留声-1.0.26-安装包.exe')
+const EXE = path.join(ROOT, 'lx-music-clone', '留声-1.0.27-安装包.exe')
 const TMP = path.join(ROOT, 'lx-music-clone', 'build', '_verify_exe')
 
 if (!fs.existsSync(EXE)) { console.error('✗ 安装包不存在'); process.exit(1) }

@@ -513,6 +513,11 @@ function __kgMapSong (x) {
 async function kgGcidPlaylist (gcid, maxSongs, opts) {
   const limitTotal = maxSongs || 2000
   const pageSize = 300
+  /* 预算从函数第一行算起，解码阶段的限流重试也计入 */
+  const __budget = Number(opts && opts.budgetMs) || 60000
+  const __deadline = Date.now() + __budget
+  const __expired = () => Date.now() > __deadline
+
   const globalId = await __kgDecodeGcid(gcid)
 
   let meta = { name: '酷狗歌单', count: 0, cover: '', intro: '' }
@@ -521,41 +526,49 @@ async function kgGcidPlaylist (gcid, maxSongs, opts) {
   const all = []
   const seen = new Set()
   let total = meta.count || 0
-  let usedAlt = false
-  /* 总预算：单请求 40s 超时，但翻页没有总上限 */
-  const __budget = Number(opts && opts.budgetMs) || 60000
-  const __deadline = Date.now() + __budget
+  let backend = 'web'
   let __timedOut = false
 
   for (let page = 1; page <= 100 && all.length < limitTotal; page++) {
     if (Date.now() > __deadline) { __timedOut = true; break }
+    /* 与桌面端一致：backend 是「当前用哪个接口」的状态，
+       而不是一次性开关。之前 usedAlt 置位后第 2 页仍先打 song_v2，
+       一失败就 break —— 800 首的歌单只能拿到 300 首。 */
     let r = null
-    try {
-      r = await __kgSongPage(globalId, page, pageSize)
-    } catch (e) {
-      if (!usedAlt) {
-        usedAlt = true
-        try { r = await __kgSongPageAlt(globalId, page, pageSize) } catch (e2) {
-          if (page === 1) throw new Error('酷狗歌单拉取失败：' + e2.message)
-          break
-        }
-      } else if (page === 1) {
-        throw new Error('酷狗歌单拉取失败：' + e.message)
-      } else { break }
+    let lastErr = null
+    const plan = backend === 'alt' ? ['alt'] : ['web', 'alt']
+    for (const b2 of plan) {
+      try {
+        r = b2 === 'web'
+          ? await __kgSongPage(globalId, page, pageSize)
+          : await __kgSongPageAlt(globalId, page, pageSize)
+        backend = b2
+        break
+      } catch (e) {
+        lastErr = e
+      }
     }
-    if (!r) break
+    if (!r) {
+      if (page === 1) throw new Error('酷狗歌单拉取失败：' + (lastErr && lastErr.message))
+      break
+    }
     if (r.total > total) total = r.total
     const list = r.list || []
     if (!list.length) break
+    /* 以「本页新增数」作为终止条件，而不是 list.length < pageSize
+       （上游钳制页大小时会误判结束） */
+    let added = 0
     for (const x of list) {
       const sm = __kgMapSong(x)
       if (!sm || seen.has(sm.id)) continue
       seen.add(sm.id)
       all.push(sm)
+      added++
       if (all.length >= limitTotal) break
     }
+    if (!added) break
     if (total && all.length >= total) break
-    if (list.length < pageSize) break
+    if (__expired()) { __timedOut = true; break }
     await new Promise((r2) => setTimeout(r2, 200))
   }
 

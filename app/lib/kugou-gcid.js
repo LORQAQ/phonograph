@@ -274,6 +274,12 @@ async function fetchGcidPlaylist (gcid, opts = {}) {
 async function __fetchGcidPlaylistInner (gcid, opts = {}) {
   const maxSongs = opts.maxSongs || 2000
   const pageSize = 300
+  /* 预算必须从函数第一行开始算。
+     原先建立在 decodeGcid / getListInfo 之后，解码阶段 4×20s 重试 + 7.2s 退避
+     完全不计入，实际最长能到 3 分钟。 */
+  const __budget = Number(opts.budgetMs) || 60000
+  const __deadline = Date.now() + __budget
+  const __expired = () => Date.now() > __deadline
 
   const { globalId, info: decodeInfo } = await decodeGcid(gcid)
 
@@ -292,10 +298,6 @@ async function __fetchGcidPlaylistInner (gcid, opts = {}) {
      之前 usedAlt 置 true 后，第 2 页仍先打 song_v2，再失败就 break ——
      800 首的歌单只能拿到 300 首。 */
   let backend = 'web'
-  /* 总预算：单请求 20s 超时，但翻 100 页没有上限 ——
-     实测有次 preview 拖了 120 秒才被客户端放弃。 */
-  const __budget = Number(opts.budgetMs) || 60000
-  const __deadline = Date.now() + __budget
   let __timedOut = false
 
   for (let page = 1; page <= 100 && all.length < maxSongs; page++) {
@@ -337,6 +339,7 @@ async function __fetchGcidPlaylistInner (gcid, opts = {}) {
     }
     if (!added) break
     if (total && all.length >= total) break
+    if (__expired()) { __timedOut = true; break }
     /* 温和一点，别触发限流 */
     await new Promise((r2) => setTimeout(r2, 200))
   }
