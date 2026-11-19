@@ -19,7 +19,12 @@ window.addEventListener('unhandledrejection', function (e) {
   try {
     var r = e.reason
     var msg = 'promise: ' + ((r && r.message) || r)
-    if (window.__NOISE__.test(msg)) return
+    /* 音源脚本内部经常直接 throw 'failed' 这种无意义 rejection，
+       光看 message 判断不出来，得连 stack 一起看来源 */
+    var stack = (r && r.stack) ? String(r.stack) : ''
+    if (/lx-source-[\w-]+\.js/.test(stack)) return
+    if (window.__NOISE__.test(msg) || window.__NOISE__.test(stack)) return
+    if (/^promise:\s*(failed|error|undefined|null|aborted)?$/i.test(msg.trim())) return
     window.__errs.push(msg)
     if (window.__errs.length > 8) window.__errs.shift()
   } catch (x) {}
