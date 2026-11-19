@@ -100,7 +100,7 @@ const BODY = [
   "s.replace(old, `  $$('.rail-item').forEach(...)`)",
   '```',
   '',
-  '结果文件里变成了 `$('.rail-item')` —— `$` 是 querySelector，没有 `.forEach`，一调用就 TypeError。',
+  "结果文件里变成了 `$('.rail-item')` —— `$` 是 querySelector，没有 `.forEach`，一调用就 TypeError。",
   '',
   '回归脚本抓到「$ 当 $$ 误用 1 处」，改成函数式替换 `s.replace(old, () => ...)` 才正确。',
   '',

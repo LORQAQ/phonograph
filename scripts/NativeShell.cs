@@ -241,6 +241,29 @@ class MainForm : Form
                         web.CoreWebView2.PostWebMessageAsString("openDirFail:" + dir);
                     }
                 }
+                else if (msg.StartsWith("openUrl:"))
+                {
+                    /* 检查更新用：前端发现新版就把 GitHub Release 页丢过来 */
+                    var url = msg.Substring("openUrl:".Length).Trim();
+                    Log("openUrl -> " + url);
+                    if (!url.StartsWith("http://") && !url.StartsWith("https://"))
+                    {
+                        Log("openUrl rejected (not http)");
+                        return;
+                    }
+                    try
+                    {
+                        var psi = new System.Diagnostics.ProcessStartInfo(url);
+                        psi.UseShellExecute = true;
+                        System.Diagnostics.Process.Start(psi);
+                        Log("openUrl ok");
+                    }
+                    catch (Exception ex)
+                    {
+                        Log("openUrl fail " + ex.Message);
+                        try { web.CoreWebView2.PostWebMessageAsString("openUrlFail:" + url); } catch { }
+                    }
+                }
                 else if (msg == "pickDir")
                 {
                     using (var dlg = new FolderBrowserDialog())

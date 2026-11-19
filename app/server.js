@@ -490,7 +490,7 @@ const routes = {
 
   async '/api/health' () {
     return {
-      ok: true, version: '1.0.0', pid: process.pid, platform: process.platform,
+      ok: true, version: '1.0.25', pid: process.pid, platform: process.platform,
       /* B7: 外壳/前端可以拿这个 token 带 X-Phonograph-Token 头 */
       token: SESSION_TOKEN,
     }
