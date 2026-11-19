@@ -1122,6 +1122,14 @@ function askDownloadFormat (song) {
 async function downloadSong (song) {
   const key = song.source + song.id
   if (state.downloading.has(key)) return toast('正在下载中…', 1200)
+  /* M7: 原生下载的 __DL_POOL 是单线程，串行本来就是设计；
+     但 JS 侧的 window.__onDownload 是全局单例，同时下两首会让
+     先完成的那个执行后者的闭包 —— toast 显示 B 的歌名配 A 的路径，
+     A 的 key 还永远卡在 state.downloading 里删不掉。
+     这里直接串行化。 */
+  if (state.downloading.size > 0) {
+    return toast('已有下载在进行，等它下完再点下一首', 1800)
+  }
 
   /* 先让用户选格式 */
   const pickedFmt = await askDownloadFormat(song)
@@ -1448,6 +1456,15 @@ function renderRecommendView () {
 /* 推荐歌单操作弹窗 */
 let pendingRec = null
 function openRecDialog (ds) {
+  /* 推荐弹窗里的「导入到我的歌单」按钮一直没绑，点了没反应 */
+  const __ri = $('#btnRecImport')
+  if (__ri) {
+    __ri.onclick = () => {
+      const p2 = pendingRec
+      try { $('#overlayRec').classList.remove('show') } catch (e) { }
+      if (p2 && p2.id) importFromCard(p2.platform, p2.id)
+    }
+  }
   pendingRec = { platform: ds.platform, id: ds.id }
   $('#recDialogCover').src = ds.cover || ''
   $('#recDialogName').textContent = ds.name || ''
@@ -2444,6 +2461,11 @@ function switchView (name) {
 
 /* ================= 下载管理 ================= */
 async function renderDownloadsView () {
+  /* P3-2: 其它 render*View 都会复位 state.view，只有这个漏了。
+     经 navGo（前进/后退）进来时没人写，导致下载成功后
+     if (state.view === 'downloads') renderDownloadsView() 不触发。 */
+  state.view = 'downloads'
+  $$('.rail-item').forEach((b) => b.classList.toggle('active', b.dataset.view === 'downloads'))
   setViewTitle('下载管理', '')
   const box = $('#panelList')
   if (!box) return

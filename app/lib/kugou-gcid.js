@@ -292,8 +292,14 @@ async function __fetchGcidPlaylistInner (gcid, opts = {}) {
      之前 usedAlt 置 true 后，第 2 页仍先打 song_v2，再失败就 break ——
      800 首的歌单只能拿到 300 首。 */
   let backend = 'web'
+  /* 总预算：单请求 20s 超时，但翻 100 页没有上限 ——
+     实测有次 preview 拖了 120 秒才被客户端放弃。 */
+  const __budget = Number(opts.budgetMs) || 60000
+  const __deadline = Date.now() + __budget
+  let __timedOut = false
 
   for (let page = 1; page <= 100 && all.length < maxSongs; page++) {
+    if (Date.now() > __deadline) { __timedOut = true; break }
     let r = null
     let lastErr = null
     const plan = backend === 'alt' ? ['alt'] : ['web', 'alt']
@@ -344,7 +350,8 @@ async function __fetchGcidPlaylistInner (gcid, opts = {}) {
     intro: meta.intro || '',
     songs: all,
     total: total || all.length,
-    truncated: total > all.length,
+    truncated: total > all.length || __timedOut,
+    timedOut: __timedOut,
   }
 }
 
