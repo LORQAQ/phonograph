@@ -510,7 +510,7 @@ function __kgMapSong (x) {
   }
 }
 
-async function kgGcidPlaylist (gcid, maxSongs) {
+async function kgGcidPlaylist (gcid, maxSongs, opts) {
   const limitTotal = maxSongs || 2000
   const pageSize = 300
   const globalId = await __kgDecodeGcid(gcid)
@@ -522,8 +522,13 @@ async function kgGcidPlaylist (gcid, maxSongs) {
   const seen = new Set()
   let total = meta.count || 0
   let usedAlt = false
+  /* 总预算：单请求 40s 超时，但翻页没有总上限 */
+  const __budget = Number(opts && opts.budgetMs) || 60000
+  const __deadline = Date.now() + __budget
+  let __timedOut = false
 
   for (let page = 1; page <= 100 && all.length < limitTotal; page++) {
+    if (Date.now() > __deadline) { __timedOut = true; break }
     let r = null
     try {
       r = await __kgSongPage(globalId, page, pageSize)
@@ -599,9 +604,24 @@ async function mobileApi (path, opts = {}) {
       const source = q.get('source') || 'wy'
       const offset = Math.max(0, Number(q.get('offset') || 0))
       const limit = Math.min(60, Math.max(6, Number(q.get('limit') || 30)))
-      if (source === 'tx') return { platform: source, offset, playlists: await NET_TX.recommendPlaylists(offset, limit), newSongs: NET_WY.newSongs ? await NET_WY.newSongs(10).catch(() => []) : [] }
-      if (source === 'kg') return { platform: source, offset, playlists: await NET_KG.recommendPlaylists(offset, limit), newSongs: NET_WY.newSongs ? await NET_WY.newSongs(10).catch(() => []) : [] }
-      return { platform: source, offset, playlists: await NET_WY.recommendPlaylists(offset, limit), newSongs: NET_WY.newSongs ? await NET_WY.newSongs(10).catch(() => []) : [] }
+      /* P2-8: 「发现页」只放本平台内容。原来 tx/kg 分支也去拉网易云新歌 ——
+         切到 QQ/酷狗显示的却是网易云的歌，而且桌面端这些分支返回 []，两端不一致。 */
+      const __newSongs = (plat) => {
+        if (plat !== 'wy') return []
+        return NET_WY.newSongs ? NET_WY.newSongs(10).catch(() => []) : []
+      }
+      if (source === 'tx') {
+        const playlists = await NET_TX.recommendPlaylists(offset, limit)
+        return { platform: source, offset, playlists, newSongs: await __newSongs('tx') }
+      }
+      if (source === 'kg') {
+        const playlists = await NET_KG.recommendPlaylists(offset, limit)
+        return { platform: source, offset, playlists, newSongs: await __newSongs('kg') }
+      }
+      {
+        const playlists = await NET_WY.recommendPlaylists(offset, limit)
+        return { platform: source, offset, playlists, newSongs: await __newSongs('wy') }
+      }
     }
 
     if (p === '/api/lyric') {

@@ -203,9 +203,48 @@ function isPrivateHost (h) {
   /* B6: URL.hostname 对 IPv6 会带方括号（'[::1]'），net.isIPv6 判不出来；
      还要处理 127.1（简写）、0x7f.0.0.1（十六进制）、::ffff:127.0.0.1（IPv4-mapped） */
   let host = String(h).toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '')
+  /* IPv4-mapped */
   if (/^::ffff:(\d+\.\d+\.\d+\.\d+)$/.test(host)) host = host.replace(/^::ffff:/, '')
-  if (/^0x[0-9a-f]+$/i.test(host)) { try { host = String(parseInt(host, 16)) } catch (e) { } }
-  if (/^\d+$/.test(host)) { try { host = '0.0.0.' + host } catch (e) { } }
+
+  /* P3-2: 浏览器的 URL 会把 127.1 / 0x7f.0.0.1 / 2130706433 / 0177.0.0.1
+     都当合法 IP，但 net.isIPv4 只认标准四段十进制。这里先把各种写法归一。
+     inet_aton 规则：a.b.c.d 里每段可以是十进制/八进制(0开头)/十六进制(0x开头)，
+     段数可以是 1~4，缺的段按 256 进位补齐。 */
+  const __aton = (str) => {
+    const parts = String(str).split('.')
+    if (parts.length > 4) return null
+    const nums = []
+    for (const raw of parts) {
+      if (!raw) return null
+      let v
+      if (/^0x[0-9a-f]+$/i.test(raw)) v = parseInt(raw, 16)
+      else if (/^0[0-7]+$/.test(raw)) v = parseInt(raw, 8)
+      else if (/^[0-9]+$/.test(raw)) v = parseInt(raw, 10)
+      else return null
+      if (!Number.isFinite(v) || v < 0) return null
+      nums.push(v)
+    }
+    /* 最后一段的有效位数取决于段数 */
+    const n = nums.length
+    if (nums.slice(0, n - 1).some((x) => x > 255)) return null
+    if (nums[n - 1] >= Math.pow(256, 5 - n)) return null
+    let ip = 0
+    for (let i2 = 0; i2 < n; i2++) {
+      if (i2 === n - 1) ip += nums[i2]
+      else ip += nums[i2] * Math.pow(256, 3 - i2)
+    }
+    return [(ip >>> 24) & 255, (ip >>> 16) & 255, (ip >>> 8) & 255, ip & 255].join('.')
+  }
+  if (!/^[0-9a-fx.]+$/i.test(host) || !host.includes('.')) {
+    /* 纯数字或纯 hex 也走 aton */
+    if (/^[0-9]+$/.test(host) || /^0x[0-9a-f]+$/i.test(host)) {
+      const n1 = __aton(host)
+      if (n1) host = n1
+    }
+  } else if (!net.isIPv4(host)) {
+    const n2 = __aton(host)
+    if (n2) host = n2
+  }
   if (typeof net.isIPv4 === 'function' && net.isIPv4(host)) {
     const [a, b] = host.split('.').map(Number)
     return a === 10 || a === 127 || a === 0 ||
