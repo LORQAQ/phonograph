@@ -188,7 +188,7 @@ function enhanceSelect (sel) {
 }
 
 /* ================= 版本与检查更新 ================= */
-const APP_VERSION = '1.0.26'
+const APP_VERSION = '1.0.27'
 const GH_OWNER = 'LORQAQ'
 const GH_REPO = 'phonograph'
 const GH_RELEASES = 'https://github.com/' + GH_OWNER + '/' + GH_REPO + '/releases/latest'
@@ -204,7 +204,12 @@ function openExternal (url) {
       window.chrome.webview.postMessage('openUrl:' + url)
       return
     }
-    if (window.open) { window.open(url, '_blank'); return }
+    /* window.open 这个函数在任何浏览器里都存在，判断它存在没有任何意义。
+       要看返回值：被拦时返回 null，这时才走 location.href。 */
+    if (typeof window.open === 'function') {
+      const w = window.open(url, '_blank')
+      if (w) return
+    }
   } catch (e) { }
   try { location.href = url } catch (e) { }
 }
@@ -231,18 +236,36 @@ async function checkUpdate () {
   const oldText = btn ? btn.textContent : ''
   if (btn) { btn.textContent = '检查中…'; btn.disabled = true }
   try {
+    /* 超时不能只靠 AbortController —— 国产 ROM 的旧 WebView（Chrome 53 及以下）
+       根本没有这个 API，那样 15 秒超时整段失效，按钮会永久停在「检查中…」。
+       这里用 Promise.race 兜底，signal 只作为「能中止就中止」的优化。 */
     const ac = typeof AbortController === 'function' ? new AbortController() : null
-    const to = ac ? setTimeout(() => { try { ac.abort() } catch (e) { } }, 15000) : null
-    let data = null
-    try {
+    const to = setTimeout(() => { try { if (ac) ac.abort() } catch (e) { } }, 15000)
+
+    const __timeoutPromise = new Promise((_, rej) => {
+      setTimeout(() => rej(Object.assign(new Error('检查更新超时'), { __timeout: true })), 15500)
+    })
+
+    const __fetchPromise = (async () => {
       const res = await fetch('https://api.github.com/repos/' + GH_OWNER + '/' + GH_REPO + '/releases/latest', {
         headers: { Accept: 'application/vnd.github+json' },
         signal: ac ? ac.signal : undefined,
       })
       if (!res.ok) throw new Error('GitHub 返回 ' + res.status)
-      data = await res.json()
+      /* 国内常见：200 + 运营商劫持页 HTML，json() 会抛 SyntaxError */
+      const text = await res.text()
+      let parsed = null
+      try { parsed = JSON.parse(text) } catch (e) {
+        throw Object.assign(new Error('返回内容不是 GitHub 数据（可能被网络劫持）'), { __badBody: true })
+      }
+      return parsed
+    })()
+
+    let data = null
+    try {
+      data = await Promise.race([__fetchPromise, __timeoutPromise])
     } finally {
-      if (to) clearTimeout(to)
+      clearTimeout(to)
     }
     const latest = (data && data.tag_name) || ''
     const url = (data && data.html_url) || GH_RELEASES
@@ -261,9 +284,22 @@ async function checkUpdate () {
     }
   } catch (e) {
     const m = String((e && e.message) || e)
-    if (/abort/i.test(m)) toast('检查更新超时，请检查网络', 2600)
-    else if (/Failed to fetch|NetworkError|Load failed/i.test(m)) toast('连不上 GitHub，请检查网络或代理', 3000)
-    else toast('检查更新失败：' + m, 3000)
+    /* 国内网络打不开 GitHub 是常态，提示要说人话，并给手动兜底 */
+    if (e && e.__timeout || /abort|timeout/i.test(m)) {
+      toast('检查更新超时，请检查网络', 2600)
+    } else if (e && e.__badBody) {
+      toast('返回内容异常（可能被网络劫持），可手动打开下载页确认', 3600)
+    } else if (/Failed to fetch|NetworkError|Load failed|fetch/i.test(m)) {
+      toast('连不上 GitHub，请检查网络或代理', 3000)
+    } else {
+      toast('检查更新失败：' + m, 3000)
+    }
+    /* 兜底：把下载页放进剪贴板，用户至少能自己去看 */
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(GH_RELEASES)
+      }
+    } catch (err) { }
   } finally {
     __updateChecking = false
     if (btn) { btn.textContent = oldText || '检查更新'; btn.disabled = false }
@@ -1210,13 +1246,18 @@ async function downloadSong (song) {
      先完成的那个执行后者的闭包 —— toast 显示 B 的歌名配 A 的路径，
      A 的 key 还永远卡在 state.downloading 里删不掉。
      这里直接串行化。 */
-  if (state.downloading.size > 0) {
+  /* 这个锁必须放在 await 之前。原先写在 await askDownloadFormat 之后，
+     选格式的整个等待窗口里锁还没上，两首歌都能穿过去 ——
+     然后 window.__onDownload（全局单例）被后者覆盖，前者的 key 永久卡死。
+     现在用 state.dlBusy 布尔锁，进入函数就置位，四条出口都释放。 */
+  if (state.dlBusy) {
     return toast('已有下载在进行，等它下完再点下一首', 1800)
   }
 
+  state.dlBusy = true
   /* 先让用户选格式 */
   const pickedFmt = await askDownloadFormat(song)
-  if (!pickedFmt) return
+  if (!pickedFmt) { state.dlBusy = false; return }
   state.dlFormat = pickedFmt
   saveSettings()
 
@@ -1246,6 +1287,7 @@ async function downloadSong (song) {
       state.downloading.delete(key)
       toast('下载失败：' + e.message, 3000)
     }
+    state.dlBusy = false
     return
   }
 
@@ -1268,6 +1310,7 @@ async function downloadSong (song) {
       state.downloading.delete(key)
       /* B86: renderList 全文件不存在，这里换成真实入口 */
       try { if (state.view === 'downloads') renderDownloadsView() } catch (e) { }
+      state.dlBusy = false
       return
     }
     __dlErr = (r0 && r0.error) || '保存失败'
@@ -1287,6 +1330,7 @@ async function downloadSong (song) {
       try { if (state.view === 'downloads') renderDownloadsView() } catch (e) { }
     }, 3000)
   }
+  state.dlBusy = false
 }
 
 /* ================= 歌词 ================= */
@@ -1740,8 +1784,14 @@ async function importFromCard (platform, id) {
     renderRailPlaylists()
     renderPlaylistView(d.imported.id)
     const sk = d.imported.skipped || 0
-    toast('已导入：' + d.imported.name + '（' + d.imported.count + ' 首）' +
-      (sk ? '，跳过 ' + sk + ' 首已下架/无版权' : ''), sk ? 4200 : 3000)
+    /* 酷狗 gcid 大歌单被限流/超时会中途截断，要让用户知道不是全量 */
+    let tip = ''
+    if (d.imported.truncated) {
+      tip = '（只取到 ' + d.imported.count + (d.imported.total ? ' / 共 ' + d.imported.total : '') + ' 首，' +
+        (d.imported.timedOut ? '请求超时' : '酷狗限流') + '，稍后重试可补全）'
+    }
+    toast('已导入：' + d.imported.name + '（' + d.imported.count + ' 首）' + tip +
+      (sk ? '，跳过 ' + sk + ' 首已下架/无版权' : ''), tip || sk ? 5200 : 3000)
   } catch (e) {
     toast('导入失败：' + e.message, 3600)
   }
@@ -2468,7 +2518,13 @@ function bindWebviewMessage () {
   __wvMsgBound = true
   window.chrome.webview.addEventListener('message', (ev) => {
     const data = String(ev.data || '')
-    if (data.startsWith('openDirFail:')) {
+if (data.startsWith('openUrlFail:')) {
+      const u = data.slice('openUrlFail:'.length)
+      try { if (navigator.clipboard) navigator.clipboard.writeText(u) } catch (e) { }
+      toast('系统没能打开浏览器，下载地址已复制到剪贴板', 3600)
+      return
+    }
+        if (data.startsWith('openDirFail:')) {
       const p2 = data.slice('openDirFail:'.length)
       toast('系统不允许自动打开文件夹，路径已复制：' + p2, 5000)
       try { navigator.clipboard.writeText(p2) } catch (e) { }
