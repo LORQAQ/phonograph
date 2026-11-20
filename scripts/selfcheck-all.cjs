@@ -12,9 +12,11 @@ const NODE = path.join(process.cwd(), 'runtime', 'node.exe')
 
 const SUITES = [
   ['服务端全量回归', 'scripts/regress-all.cjs'],
-  ['构建产物一致性', null],   /* 合并在 regress-all 里 */
   ['检查更新实现', 'scripts/verify-update.cjs'],
   ['第六轮 5 项', 'scripts/verify-round6.cjs'],
+  ['写方法修复', 'scripts/verify-write-fix.cjs'],
+  ['APK 归档校验', 'scripts/verify-apk-archived.cjs'],
+  ['打包产物一致性', 'scripts/verify-packaged-posts.cjs'],
   ['CSS 布局计算', 'scripts/check-css-math.cjs'],
   ['APK 内容', 'scripts/verify-apk.cjs'],
   ['安装包内容', 'scripts/verify-installer.cjs'],

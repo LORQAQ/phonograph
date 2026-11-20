@@ -75,6 +75,10 @@ let saveTimer = null
 /* B41: 合并写入 + 上限延迟（连续拖音量不会永远不落盘）+ 失败向上抛 */
 let dbDirty = false
 let dbFirstDirtyAt = 0
+/* P0: 指数退避的重试计数。之前只有赋值没有声明，
+   'use strict' 下每次保存都会抛 ReferenceError，
+   被当成写盘失败 → 重试逻辑永远不生效，磁盘上一直是旧值。 */
+let dbRetry = 0
 
 function saveDb () {
   dbDirty = true
@@ -86,6 +90,20 @@ function saveDb () {
 }
 
 function flushDb () {
+  /* guard: 这个函数唯一的常规调用点是 setTimeout 回调，
+     任何异常逃出去都会变成 uncaughtException。
+     内层已经自己处理了写盘失败，这里只是最后一道保险。 */
+  try {
+    flushDbInner()
+  } catch (e) {
+    try { console.error('[db] flushDb 异常（已兜住）:', e && e.message) } catch (e2) { }
+    dbDirty = true
+    if (!saveTimer) {
+      try { saveTimer = setTimeout(flushDb, 5000) } catch (e3) { }
+    }
+  }
+}
+function flushDbInner () {
   if (!dbDirty) return
   clearTimeout(saveTimer)
   saveTimer = null
@@ -160,22 +178,24 @@ const SESSION_TOKEN = process.env.PHONOGRAPH_TOKEN || crypto.randomBytes(24).toS
 
 /* B7: 同源校验 —— 只接受本机 origin，防止恶意网页跨站 POST */
 function sameOrigin (req) {
+  /* Host 头由请求方决定，不能当信任锚 —— 否则 DNS rebinding 直接绕过：
+     evil.example 解析到 127.0.0.1 后，浏览器同时发 Host 和 Origin 都是 evil.example，
+     两者相等就被放行。这里先验 Host 必须是本机地址。 */
+  const hostRaw = String(req.headers.host || '')
+  const hostName = hostRaw.replace(/:\d+$/, '').replace(/^\[|\]$/g, '').toLowerCase()
+  const isLocalHost = hostName === 'localhost' || hostName === '127.0.0.1' || hostName === '::1' ||
+    (Array.isArray(global.__LAN_IPS) && global.__LAN_IPS.indexOf(hostName) !== -1)
+  if (hostName && !isLocalHost) return false
+
   const o = req.headers.origin
-  /* 无 Origin 的本地请求（curl / 外壳）放行。
-     'null' 是沙箱 iframe / file:// 的 Origin —— 任意网页都能造出来，
-     放行等于把全部写接口暴露给任何网站，必须拒绝。 */
-  if (!o) return true
-  if (o === 'null') return false
+  if (!o) return true                    /* 无 Origin 的本地请求（curl / 外壳）放行 */
+  if (o === 'null') return false         /* 沙箱 iframe 可伪造 */
   let u = null
-  try { u = new URL(o) } catch (e) { return false }
-  /* 同主机同端口（含局域网 IP、[::1]）—— 手机浏览器访问时 Origin 就是 LAN 地址 */
-  const host = String(req.headers.host || '')
-  if (host && u.host === host) return true
-  if (/^(127\.0\.0\.1|localhost|\[::1\])$/.test(u.hostname)) return true
-  /* 开局域网模式时，本机所有网卡地址也放行 */
-  try {
-    if ((global.__LAN_IPS || []).includes(u.hostname)) return true
-  } catch (e) { }
+  try { u = new URL(o) } catch (err) { return false }
+  const oName = String(u.hostname || '').replace(/^\[|\]$/g, '').toLowerCase()
+  if (oName === hostName) return true
+  if (oName === '127.0.0.1' || oName === 'localhost' || oName === '::1') return true
+  if (Array.isArray(global.__LAN_IPS) && global.__LAN_IPS.indexOf(oName) !== -1) return true
   return false
 }
 
@@ -534,7 +554,11 @@ const routes = {
     const platform = q.get('source') || 'wy'
     const quality = q.get('quality') || db.settings.quality || '320k'
     const cacheKey = platform + '|' + id + '|' + quality + '|' + (q.get('only') || '')
-    const hitVal = cacheGet(urlCache, cacheKey)
+    /* P1: force=1 时跳过缓存 —— 前端「换个音源重试」必须真的重新解析，
+       否则拿回的还是同一条已失效的 CDN 直链。 */
+    const __force = q.get('force') === '1' || q.get('nocache') === '1'
+    if (__force) { urlCache.delete(cacheKey); urlInflight.delete(cacheKey) }
+    const hitVal = __force ? null : cacheGet(urlCache, cacheKey)
     if (hitVal) return Object.assign({ id, source: platform, cached: true }, hitVal)
     /* B18: 已有同样的请求在飞，直接复用 */
     if (urlInflight.has(cacheKey)) return urlInflight.get(cacheKey)
@@ -564,7 +588,11 @@ const routes = {
     if (!id) throw Object.assign(new Error('缺少歌曲 id'), { code: 400 })
     const platform = q.get('source') || 'wy'
     const info = await buildMusicInfo(platform, id, extraFromQuery(q))
-    const list = await sourceManager.testAll(platform, info, q.get('quality') || db.settings.quality || '320k')
+    /* P1: 12 秒总预算，避免 N 个源串行累加导致接口长期挂起 */
+    const list = await Promise.race([
+      sourceManager.testAll(platform, info, q.get('quality') || db.settings.quality || '320k'),
+      new Promise((_, rej) => setTimeout(() => rej(Object.assign(new Error('音源测试超时'), { code: 504 })), 12000)),
+    ])
     return { id, source: platform, list }
   },
 
@@ -577,7 +605,10 @@ const routes = {
     /* 与 /api/url 走同一条路径：等音源就绪 + 跨平台兜底 + 缓存 */
     const cacheKey = platform + '|' + id + '|' + quality + '|' + (q.get('only') || '')
     let target = ''
-    const hitVal = cacheGet(urlCache, cacheKey)
+    /* P1: 与 /api/url 一致，force=1 时跳过缓存 */
+    const __forceS = q.get('force') === '1' || q.get('nocache') === '1'
+    if (__forceS) { urlCache.delete(cacheKey); urlInflight.delete(cacheKey) }
+    const hitVal = __forceS ? null : cacheGet(urlCache, cacheKey)
     if (hitVal) {
       target = hitVal.url
     } else {
@@ -591,10 +622,11 @@ const routes = {
       })
       target = result && result.url
       if (target) {
-        urlCache.set(cacheKey, {
-          value: { id, source: platform, quality: result.quality, provider: result.provider, url: target },
-          exp: Date.now() + 5 * 60e3,
-        })
+        /* P2: 原来这里用裸 Map.set，绕过了 cacheSet 的 300 条上限与 LRU，
+           长期运行会只增不减。 */
+        cacheSet(urlCache, cacheKey,
+          { id, source: platform, quality: result.quality, provider: result.provider, url: target },
+          5 * 60e3, 300)
       }
     }
 
@@ -771,6 +803,11 @@ const routes = {
   },
 
   async '/api/download' (req, q, res) {
+    /* P1: save=1 会往用户磁盘写文件，必须 POST。
+       否则任何网页用一个 <img src="...&save=1"> 就能触发（跨站 GET 不带 Origin）。 */
+    if (q.get('save') === '1' && req.method !== 'POST' && req.method !== 'PUT') {
+      throw Object.assign(new Error('保存下载需要 POST'), { code: 405 })
+    }
     const id = q.get('id')
     if (!id) return json(res, 400, { error: '缺少歌曲 id' })
     const platform = q.get('source') || 'wy'
@@ -981,8 +1018,9 @@ const routes = {
     }
     if (!sourceCode) throw Object.assign(new Error('缺少脚本内容'), { code: 400 })
     const file = sourceManager.install(name || 'imported-' + Date.now(), sourceCode)
-    const id = file.replace(/\.js$/i, '')
-    await sourceManager.reload(id)
+    /* P1: install() 只写文件、不注册 entry，所以 reload(id) 必然抛「音源不存在」。
+       新文件直接 loadOne，它会 init 并写进 entries。 */
+    await sourceManager.loadOne(file)
     return { list: sourceManager.list(), file }
   },
 
@@ -1007,14 +1045,39 @@ const routes = {
       /* B51: 脱敏后前端拿不到 qqCookie，输入框永远是空的。
          用户点保存会提交 {qqCookie: ''}，把真 Cookie 洗掉。
          这里做「空值不覆盖」。 */
-      const patch = Object.assign({}, body)
+      /* P2: 只接受已知键。原来 Object.assign 任意键直落，
+         可以绕过 /api/download-dir 的目录校验写坏 downloadDir。 */
+      const ALLOW = ['quality', 'platform', 'volume', 'sourceOrder', 'disabledSources', 'qqCookie',
+        'theme', 'themeMode', 'sleepMinutes', 'dlFormat', 'themeFromCover']
+      const patch = {}
+      for (const k of ALLOW) {
+        if (body && Object.prototype.hasOwnProperty.call(body, k)) patch[k] = body[k]
+      }
+      /* downloadDir 走独立校验：必须能创建且可写，否则 400 */
+      if (body && typeof body.downloadDir === 'string') {
+        const dir = body.downloadDir.trim()
+        if (dir) {
+          let mkErr = ''
+          try { fs.mkdirSync(dir, { recursive: true }) } catch (err2) { mkErr = err2.code + ': ' + err2.message }
+          if (mkErr) throw Object.assign(new Error('目录无法创建（' + mkErr + '）'), { code: 400 })
+          let wErr = ''
+          try {
+            const probe = path.join(dir, 'w_test.tmp')
+            fs.writeFileSync(probe, 'ok')
+            fs.unlinkSync(probe)
+          } catch (err3) { wErr = err3.code + ': ' + err3.message }
+          if (wErr) throw Object.assign(new Error('目录不可写（' + wErr + '）'), { code: 400 })
+          patch.downloadDir = dir
+        } else {
+          patch.downloadDir = ''
+        }
+      }
       /* P3-5: 显式清空用 clearQqCookie，空串仍然表示「不修改」 */
-      if (patch.clearQqCookie === true) {
+      if (body && body.clearQqCookie === true) {
         patch.qqCookie = ''
       } else if (patch.qqCookie === undefined || patch.qqCookie === '' || patch.qqCookie === null) {
         delete patch.qqCookie
       }
-      delete patch.clearQqCookie
       Object.assign(db.settings, patch)
       sourceManager.config = db.settings
       for (const e of sourceManager.entries.values()) e.enabled = sourceManager.enabledOf(e.id)
@@ -1169,6 +1232,7 @@ const server = http.createServer(async (req, res) => {
         '/api/downloads/remove',
         '/api/downloads/reveal',
         '/api/sources/test',
+        '/api/download',
       ])
       /* B7: 统一守卫（Origin + 可选 token）。token 由外壳通过 env 注入，
          前端可以用 X-Phonograph-Token 带；不带也放行（本地单机场景） */

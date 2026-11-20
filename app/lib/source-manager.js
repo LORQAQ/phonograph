@@ -307,7 +307,11 @@ class SourceManager {
       const entry = this.entries.get(c.id)
       const t0 = Date.now()
       try {
-        const url = await entry.script.musicUrl(platform, musicInfo, quality)
+        /* P1: 这里原来没有超时。脚本的 musicUrl 只要不 settle
+           （网络挂住 / await 一个永不返回的 Promise / TCP 半开），
+           整个 /api/sources/test 就永久挂起，前端按钮一直转圈。
+           resolveUrl 那条路径有 5 秒超时，这里保持一致。 */
+        const url = await callWithTimeout(() => entry.script.musicUrl(platform, musicInfo, quality), 5000)
         const ok = typeof url === 'string' && /^https?:\/\//.test(url)
         results.push({ id: c.id, name: entry.meta.name, ok, ms: Date.now() - t0, url: ok ? url : '', error: ok ? '' : '返回空地址' })
       } catch (e) {

@@ -44,9 +44,19 @@ function cached (key, ttl, fn) {
   return p
 }
 
+/* P2: 设置里粘贴的 cookie 之前只被 playlist-import 用到，
+   搜索/详情/歌词全都发静态 HEADERS，等于填了也不生效。 */
+function headersNow () {
+  try {
+    const c = currentCookie()
+    if (c) return Object.assign({}, HEADERS, { Cookie: c })
+  } catch (e) { }
+  return HEADERS
+}
+
 function api (url, timeout = 15000) {
   return new Promise((resolve, reject) => {
-    request(url, { headers: HEADERS, timeout }, (err, resp) => {
+    request(url, { headers: headersNow(), timeout }, (err, resp) => {
       if (err) return reject(new Error('QQ 音乐接口失败: ' + err.message))
       let body = resp.body
       if (typeof body === 'string') {
