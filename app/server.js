@@ -499,7 +499,7 @@ const routes = {
 
   async '/api/health' () {
     return {
-      ok: true, version: '1.0.27', pid: process.pid, platform: process.platform,
+      ok: true, version: '1.0.28', pid: process.pid, platform: process.platform,
       /* B7: 外壳/前端可以拿这个 token 带 X-Phonograph-Token 头 */
       token: SESSION_TOKEN,
     }
@@ -624,12 +624,30 @@ const routes = {
       return { ok: !openErr, dir, error: openErr || undefined }
     }
     const set = q.get('set')
-    if (set && set.trim()) {
+    /* 区分三种情况：
+       - set === null  → 没传，纯读取
+       - set 是空串    → 用户清空了输入框，恢复默认目录（前端 placeholder 写着「留空使用 音乐\留声」）
+       - set 有值      → 保存新目录 */
+    if (set !== null && set !== undefined) {
+      if (!set.trim()) {
+        delete db.settings.downloadDir
+        saveDb()
+        const d = defaultDownloadDir()
+        return { dir: d, writable: true, default: d, reset: true }
+      }
       const dir = set.trim()
-      try { fs.mkdirSync(dir, { recursive: true }) } catch (e) { }
-      db.settings.downloadDir = dir
-      saveDb()
-      /* 顺便报告当前进程能否写（不阻止保存） */
+      /* 先建目录。建不出来就直接报错，别把这个坏路径存进 db ——
+         否则用户看到「已保存」，之后每次下载都失败，还找不到原因。 */
+      let mkErr = ''
+      try {
+        fs.mkdirSync(dir, { recursive: true })
+      } catch (e) {
+        mkErr = (e.code || '') + (e.code ? ': ' : '') + e.message
+      }
+      if (mkErr) {
+        throw Object.assign(new Error('目录无法创建（' + mkErr + '）'), { code: 400 })
+      }
+      /* 再实测可写 */
       let writable = true
       let errMsg = ''
       try {
@@ -638,9 +656,15 @@ const routes = {
         fs.unlinkSync(probe)
       } catch (e) {
         writable = false
-        errMsg = e.message
+        errMsg = (e.code || '') + (e.code ? ': ' : '') + e.message
       }
-      return { dir, writable, error: errMsg || undefined, default: defaultDownloadDir() }
+      /* 不可写也不保存 —— 存了也用不了 */
+      if (!writable) {
+        throw Object.assign(new Error('目录不可写（' + errMsg + '）'), { code: 400 })
+      }
+      db.settings.downloadDir = dir
+      saveDb()
+      return { dir, writable: true, default: defaultDownloadDir() }
     }
     const dir = db.settings.downloadDir || defaultDownloadDir()
     let writable = true
@@ -1143,6 +1167,8 @@ const server = http.createServer(async (req, res) => {
         '/api/sources/toggle', '/api/sources/reload', '/api/sources/remove',
         '/api/sources/import', '/api/playlist', '/api/shutdown',
         '/api/downloads/remove',
+        '/api/downloads/reveal',
+        '/api/sources/test',
       ])
       /* B7: 统一守卫（Origin + 可选 token）。token 由外壳通过 env 注入，
          前端可以用 X-Phonograph-Token 带；不带也放行（本地单机场景） */

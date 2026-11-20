@@ -188,7 +188,7 @@ function enhanceSelect (sel) {
 }
 
 /* ================= 版本与检查更新 ================= */
-const APP_VERSION = '1.0.27'
+const APP_VERSION = '1.0.28'
 const GH_OWNER = 'LORQAQ'
 const GH_REPO = 'phonograph'
 const GH_RELEASES = 'https://github.com/' + GH_OWNER + '/' + GH_REPO + '/releases/latest'
@@ -2294,7 +2294,7 @@ async function renderSourcesPane () {
     box.style.display = 'block'
     box.innerHTML = `<div class="card"><div class="card-title">正在测速「${esc(song.name)}」…</div></div>`
     try {
-      const data = await api('/api/sources/test?' + songParams(song).toString())
+      const data = await api('/api/sources/test?' + songParams(song).toString(), { method: 'POST' })
       const list = data.list || []
       const max = Math.max(...list.map((x) => x.ms || 1), 1)
       box.innerHTML = `<div class="card"><div class="card-head"><div class="card-title">测速结果</div><span class="badge">${esc(data.source)}</span></div>
@@ -2431,11 +2431,17 @@ function renderSettingsPane () {
     $('#dlDirSave').onclick = async () => {
       const v = ($('#dlDir').value || '').trim()
       try {
-        const r = await api('/api/download-dir?set=' + encodeURIComponent(v))
+        const r = await api('/api/download-dir?set=' + encodeURIComponent(v), { method: 'POST' })
         $('#dlDir').value = r.dir
-        if (r && r.writable === false) toast('已设为：' + r.dir + '（当前进程写不进去，重启程序后一般正常）', 4200)
-        else toast('下载目录已设为：' + r.dir, 2600)
-      } catch (e) { toast('设置失败：' + e.message, 2600) }
+        /* 服务端新增：目录建不出来/不可写时会直接返回 400，
+           所以走到这里就是真的成功了，不再需要 writable 判断 */
+        toast('下载目录已设为：' + r.dir, 2600)
+      } catch (e) {
+        /* 目录不可用是用户输入问题，不是程序故障，措辞要说清楚 */
+        const m = String(e.message || e)
+        if (/目录|EPERM|EACCES|ENOENT|EEXIST|不可写/.test(m)) toast('目录不可用：' + m, 4200)
+        else toast('设置失败：' + m, 3200)
+      }
     }
 /* 选择目录：桌面壳弹系统文件夹选择框；浏览器里退回 $showDirectoryPicker$ */
     if ($('#dlDirPick')) {
@@ -2534,10 +2540,14 @@ if (data.startsWith('openUrlFail:')) {
     const dir = data.slice('dirPicked:'.length)
     const inp = $('#dlDir')
     if (inp) inp.value = dir
-    api('/api/download-dir?set=' + encodeURIComponent(dir)).then((r) => {
-      if (r && r.writable === false) toast('已设为：' + dir + '（当前进程写不进去，重启程序后一般正常）', 4200)
-      else toast('下载目录已设为：' + dir, 3000)
-    }).catch((e) => toast('设置失败：' + e.message, 3000))
+    api('/api/download-dir?set=' + encodeURIComponent(dir), { method: 'POST' }).then((r) => {
+      /* 服务端不可写时会直接 400，走到这里就是成功 */
+      toast('下载目录已设为：' + dir, 3000)
+    }).catch((e) => {
+      const m = String(e.message || e)
+      if (/目录|EPERM|EACCES|ENOENT|EEXIST|不可写/.test(m)) toast('目录不可用：' + m, 4200)
+      else toast('设置失败：' + m, 3200)
+    })
   })
 }
 
@@ -2685,7 +2695,7 @@ async function renderDownloadsView () {
         return
       }
       try {
-        const r = await api('/api/downloads/reveal?name=' + encodeURIComponent(name) + '&dir=' + encodeURIComponent(dir))
+        const r = await api('/api/downloads/reveal?name=' + encodeURIComponent(name) + '&dir=' + encodeURIComponent(dir), { method: 'POST' })
         if (r && r.ok) { toast('已打开文件夹', 1600); return }
         try { await navigator.clipboard.writeText((r && r.path) || name) } catch (er) { }
         toast('打不开文件夹，路径已复制：' + ((r && r.path) || name), 4200)
@@ -2701,7 +2711,7 @@ async function renderDownloadsView () {
       const name = decodeURIComponent(tr.dataset.name)
       if (!confirm('删除「' + name + '」？')) return
       try {
-        await api('/api/downloads/remove?name=' + encodeURIComponent(name))
+        await api('/api/downloads/remove?name=' + encodeURIComponent(name), { method: 'POST' })
         toast('已删除', 1600)
         renderDownloadsView()
       } catch (err) { toast('删除失败：' + err.message, 2600) }
