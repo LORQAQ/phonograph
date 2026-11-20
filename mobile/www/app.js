@@ -197,7 +197,7 @@ function enhanceSelect (sel) {
 }
 
 /* ================= 版本与检查更新 ================= */
-const APP_VERSION = '1.0.28'
+const APP_VERSION = '1.0.29'
 const GH_OWNER = 'LORQAQ'
 const GH_REPO = 'phonograph'
 const GH_RELEASES = 'https://github.com/' + GH_OWNER + '/' + GH_REPO + '/releases/latest'

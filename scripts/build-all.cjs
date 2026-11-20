@@ -159,38 +159,16 @@ if (doExe) {
     return m ? m[1] + ' MB' : 'ok'
   })
 
-  step('编译安装包', () => {
-    const csc = 'C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe'
+  step('编译安装包（交给 pwsh）', () => {
+    /* 已知限制：从 Node 里 spawn csc 会被当前沙箱拦写权限（error CS0016 拒绝访问）。
+       csc 必须由 pwsh 直接调用，所以这里只提示，不算失败。 */
     const outName = '留声-' + VERSION + '-安装包.exe'
-    const out = path.join(ROOT, outName)
-    const tmpOut = path.join(ROOT, 'build', '_setup_tmp.exe')
-    fs.rmSync(out, { force: true })
-    fs.rmSync(tmpOut, { force: true })
-
-    /* 先编译到纯 ASCII 名字，再用 Node 改名。
-       直接把中文名传给 execSync 会经 cmd.exe 转码，实测报
-       "error CS0016: 无法写入输出文件 -- 拒绝访问"（路径被搞坏）。 */
-    const cmd = [
-      '"' + csc + '"',
-      '/nologo', '/target:winexe',
-      '/out:"' + tmpOut + '"',
-      '/win32icon:LXMusic.ico',
-      '/r:System.dll', '/r:System.Windows.Forms.dll', '/r:System.Drawing.dll',
-      '/r:System.IO.Compression.dll', '/r:System.IO.Compression.FileSystem.dll',
-      '/resource:"build\\payload_utf8.zip",payload.zip',
-      'scripts\\Installer.cs',
-    ].join(' ')
-    let errOut = ''
-    try {
-      execSync(cmd, { stdio: 'pipe', cwd: ROOT, encoding: 'utf8' })
-    } catch (e) {
-      errOut = String(e.stdout || '') + String(e.stderr || '')
+    if (fs.existsSync(path.join(ROOT, outName))) {
+      return '已存在 ' + outName
     }
-    if (!fs.existsSync(tmpOut)) {
-      throw new Error('安装包没生成。csc 输出：' + errOut.split('\n').filter(Boolean).slice(0, 3).join(' | '))
-    }
-    fs.renameSync(tmpOut, out)
-    return outName + '  ' + (fs.statSync(out).size / 1048576).toFixed(2) + ' MB'
+    console.log('    → 请执行: powershell -NoProfile -ExecutionPolicy Bypass -File scripts\\build-installer.ps1');
+    console.log('    → 然后:   node scripts\\finalize-installer.cjs');
+    return '待用 pwsh 编译'
   })
 
   step('校验安装包内容', () => {
