@@ -62,6 +62,15 @@ const state = {
   dragIndex: -1,
   sleepAt: 0,
   sleepTimer: null,
+  /* P3: 运行时锁/句柄补进初始值，读代码能一眼看出有哪些在途状态，
+     漏置位或异常路径漏复位时也有初值可查 */
+  dlBusy: false,
+  __importing: false,
+  __qualitySwitching: false,
+  __pcCleanup: null,
+  __triedPlat: null,
+  __switchCount: 0,
+  settings: null,
 }
 
 /* ================= 工具 ================= */
@@ -812,13 +821,17 @@ async function streamSrc (song, only, forceFresh) {
   const ck = song.source + '|' + song.id + '|' + (only || '') + '|' + state.quality + '|' + state.dlFormat
   const hit = __urlCache.get(ck)
   if (!forceFresh && hit && hit.exp > Date.now()) return hit.url
-  const url = await __streamSrcInner(song, only)
+  const url = await __streamSrcInner(song, only, forceFresh)
   if (url) __urlCache.set(ck, { url, exp: Date.now() + URL_TTL })
   return url
 }
 
-async function __streamSrcInner (song, only) {
-  const qs = songParams(song, only).toString()
+async function __streamSrcInner (song, only, forceFresh) {
+  const sp = songParams(song, only)
+  /* P1: 重试时必须把 force 传给服务端/手机端缓存层，
+     否则绕过的只是前端这层 5 分钟缓存，拿回的还是同一条死链。 */
+  if (forceFresh) sp.set('force', '1')
+  const qs = sp.toString()
   if (!window.__MOBILE__) return '/api/stream?' + qs
   try {
     const d = await api('/api/url?' + qs)
@@ -1114,7 +1127,10 @@ async function onAudioError () {
     return
   }
   toast('播放失败，跳过这首…', 1400)
-  setTimeout(() => playNext(true), 700)
+  /* P1: 这 0.7 秒内用户可能已经点了别的歌或暂停了，
+     没有 token 守卫就会把用户刚点的歌顶掉。 */
+  const __skipTok = state.playToken
+  setTimeout(() => { if (__skipTok === state.playToken) playNext(true) }, 700)
 }
 
 async function reloadCurrent (prevQualityArg) {
@@ -1471,11 +1487,15 @@ function showHistory () {
 
 /* P1-4: 去掉 loading 早退后必须用序号丢弃过期响应 */
 let searchSeq = 0
+/* P1: 视图令牌。切视图就自增，在途的异步渲染靠它判断"我是否已经过时"。
+   没有它的话，搜索请求晚回来会把用户已经切过去的新页面整个覆盖掉。 */
+let __viewToken = 0
 async function doSearch (append = false) {
   const kw = $('#searchInput').value.trim()
   /* B66: 不再因 loading 丢弃新搜索 */
   if (!kw) return
   const seq = ++searchSeq
+  const __vt = __viewToken
   state.keyword = kw
   state.view = 'search'
   state.loading = true
@@ -1487,15 +1507,17 @@ async function doSearch (append = false) {
   if (!append) $('#panelList').innerHTML = skeletonList()
   try {
     const data = await api('/api/search?kw=' + encodeURIComponent(kw) + '&limit=50&page=' + state.page + '&source=' + state.platform)
-    /* 迟到的响应直接丢弃，避免两次搜索互相覆盖 */
-  if (seq !== searchSeq) return
-  state.results = append ? state.results.concat(data.list || []) : (data.list || [])
+    /* 迟到的响应直接丢弃：既要防两次搜索互相覆盖，也要防用户已经切走视图 */
+    if (seq !== searchSeq || __vt !== __viewToken || state.view !== 'search') return
+    state.results = append ? state.results.concat(data.list || []) : (data.list || [])
     state.resultsTotal = data.total || state.results.length
     state.hasMore = state.results.length < state.resultsTotal && (data.list || []).length >= 20
     renderSearchResults()
   } catch (e) {
+    /* P1/P2: 迟到的错误不能盖掉用户已经切过去的视图、也不能盖掉新搜索的结果 */
+    if (seq !== searchSeq || __vt !== __viewToken || state.view !== 'search') return
     $('#panelList').innerHTML = `<div class="empty">${svg('i-search')}<b>搜索失败</b>${esc(e.message)}</div>`
-  } finally { state.loading = false }
+  } finally { if (seq === searchSeq) state.loading = false }
 }
 
 function skeletonList () {
@@ -1722,6 +1744,7 @@ function renderRecGrid () {
 }
 
 async function loadRecPage (reset) {
+  const __vt = __viewToken    /* P1: 视图令牌，回来时校验是否还该渲染 */
   const grid = $('#recGrid') || { innerHTML: '', textContent: '', style: {}, value: '', classList: { add () {}, remove () {}, toggle () {} }, addEventListener () {}, appendChild () {}, querySelector () { return null }, querySelectorAll () { return [] }, setAttribute () {} }
   if (!grid) return
   if (reset) {
@@ -1736,6 +1759,7 @@ async function loadRecPage (reset) {
   renderRecGrid()
   try {
     const d = await api('/api/discover?source=' + recState.platform + '&offset=' + recState.offset + '&limit=30')
+    if (__vt !== __viewToken) return
     if (recState.platform !== state.platform) return
     const list = (d.playlists || []).filter((p) => !recState.list.some((x) => x.id === p.id))
     recState.list = recState.list.concat(list)
@@ -1799,6 +1823,7 @@ async function importFromCard (platform, id) {
 
 /* ================= 榜单 ================= */
 async function renderLeaderboard () {
+  const __vt = __viewToken    /* P1: 视图令牌，回来时校验是否还该渲染 */
   state.view = 'leaderboard'
   setViewTitle('排行榜', PLATFORM_NAME[state.platform])
   const tabs = RANK_TABS[state.platform] || RANK_TABS.wy
@@ -1811,6 +1836,7 @@ async function renderLeaderboard () {
   box.querySelectorAll('.sh-chip').forEach((b) => { b.onclick = () => { state.leaderboardType = b.dataset.t; renderLeaderboard() } })
   try {
     const data = await api('/api/toplist?type=' + state.leaderboardType + '&source=' + state.platform)
+    if (__vt !== __viewToken || state.view !== 'leaderboard') return
     state.results = data.list || []
     if ($('#leaderBody')) $('#leaderBody').innerHTML = `<div class="queue-head"><span>${esc(data.name || '')}</span><span>${data.list.length}</span></div>
       <table class="song-list"><tbody>${data.list.map((s, i) => songRow(s, i)).join('')}</tbody></table>`
@@ -1898,6 +1924,9 @@ function renderRecentView () {
 /* ================= 歌单 ================= */
 async function loadPlaylists () {
   const data = await api('/api/db')
+  /* P3: 200 + 非 JSON 时 api() 返回 null，这里要挡住，
+     否则界面会显示成「没有歌单」而用户以为数据被清空了 */
+  if (!data || !Array.isArray(data.playlists)) throw new Error('歌单数据异常')
   state.playlists = data.playlists
   if (!state.currentPlaylist) state.currentPlaylist = state.playlists[0] && state.playlists[0].id
   renderRailPlaylists()
@@ -2007,10 +2036,12 @@ function renderCollectionsView () {
 async function newPlaylist () {
   const name = prompt('新歌单名称', '新歌单')
   if (!name) return
-  const data = await api('/api/playlist', { method: 'POST', body: { action: 'create', name } })
-  state.playlists = data.playlists
-  renderRailPlaylists()
-  toast('已创建：' + name)
+  try {
+    const data = await api('/api/playlist', { method: 'POST', body: { action: 'create', name } })
+    state.playlists = data.playlists
+    renderRailPlaylists()
+    toast('已创建：' + name)
+  } catch (e) { toast('创建失败：' + (e.message || e), 3000) }
 }
 
 /* 导入歌单 */
@@ -2032,6 +2063,13 @@ async function doImportPlaylist () {
     st.textContent = '请粘贴歌单链接或 ID'
     return
   }
+  /* P2: 连按回车会并发两次，服务端每次 push 一个新歌单 → 出现两份重复 */
+  if (state.__importing) {
+    st.className = 'import-status'
+    st.textContent = '上一次导入还没结束，请稍等'
+    return
+  }
+  state.__importing = true
   st.className = 'import-status'
   st.textContent = '正在导入…'
   btn.disabled = true
@@ -2048,25 +2086,30 @@ async function doImportPlaylist () {
     st.className = 'import-status err'
     st.textContent = '导入失败：' + e.message
   } finally {
+    state.__importing = false
     btn.disabled = false
   }
 }
 async function renamePlaylist (pl) {
   const name = prompt('重命名歌单', pl.name)
   if (!name || name === pl.name) return
-  const data = await api('/api/playlist', { method: 'POST', body: { action: 'rename', id: pl.id, name } })
-  state.playlists = data.playlists
-  renderRailPlaylists()
-  if (state.view === 'playlist') renderPlaylistView(pl.id)
+  try {
+    const data = await api('/api/playlist', { method: 'POST', body: { action: 'rename', id: pl.id, name } })
+    state.playlists = data.playlists
+    renderRailPlaylists()
+    if (state.view === 'playlist') renderPlaylistView(pl.id)
+  } catch (e) { toast('重命名失败：' + (e.message || e), 3000) }
 }
 async function deletePlaylist (pl) {
   if (!confirm(`确定删除歌单「${pl.name}」？`)) return
-  const data = await api('/api/playlist', { method: 'POST', body: { action: 'delete', id: pl.id } })
-  state.playlists = data.playlists
-  state.currentPlaylist = state.playlists[0] && state.playlists[0].id
-  renderRailPlaylists()
-  switchView('playlist')
-  toast('歌单已删除')
+  try {
+    const data = await api('/api/playlist', { method: 'POST', body: { action: 'delete', id: pl.id } })
+    state.playlists = data.playlists
+    state.currentPlaylist = state.playlists[0] && state.playlists[0].id
+    renderRailPlaylists()
+    switchView('playlist')
+    toast('歌单已删除')
+  } catch (e) { toast('删除失败：' + (e.message || e), 3000) }
 }
 async function addToPlaylist (song, listId, tip) {
   try {
@@ -2080,11 +2123,13 @@ async function addToPlaylist (song, listId, tip) {
   } catch (e) { toast(e.message) }
 }
 async function removeFromPlaylist (listId, song) {
-  const data = await api('/api/playlist', { method: 'POST', body: { action: 'remove', listId, id: song.id } })
-  state.playlists = data.playlists
-  renderRailPlaylists()
-  if (state.view === 'playlist') renderPlaylistView(listId)
-  toast('已从歌单移除')
+  try {
+    const data = await api('/api/playlist', { method: 'POST', body: { action: 'remove', listId, id: song.id } })
+    state.playlists = data.playlists
+    renderRailPlaylists()
+    if (state.view === 'playlist') renderPlaylistView(listId)
+    toast('已从歌单移除')
+  } catch (e) { toast('移除失败：' + (e.message || e), 3000) }
 }
 
 /* ================= 面板 tab ================= */
@@ -2390,9 +2435,12 @@ function renderSettingsPane () {
 
   $('#setQuality').value = state.quality
   $('#setQuality').onchange = (e) => {
+    /* P2: 原来只存值不重载当前歌，用户以为没生效；顶栏切音质是会重载的 */
+    const __prevQ = state.quality
     state.quality = e.target.value
     $('#qualitySelect').value = state.quality
     saveSettings()
+    if (state.currentSong) { try { reloadCurrent(__prevQ) } catch (err) { } }
   }
   $('#setCoverTheme').onchange = (e) => {
     state.themeFromCover = e.target.checked
@@ -2463,6 +2511,10 @@ function renderSettingsPane () {
       }
     }
     bindWebviewMessage()
+    /* P2: 设置面板是动态生成的，boot 时的 enhanceSelect 跑在它之前，
+       所以 #setQuality 一直是原生控件（顶栏那两个是主题化的）。
+       这里补一次，顺便修掉「同一个功能两种控件」的不一致。 */
+    try { const __sq = $('#setQuality'); if (__sq) enhanceSelect(__sq) } catch (e) { }
     /* P2-3: 下载格式按钮之前只在 renderDownloadsView 里绑定，
        不进下载页就点不动 */
     $$('.dl-fmt').forEach((b) => {
@@ -2588,6 +2640,8 @@ function onHotkey (e) {
 
 /* ================= 视图切换 ================= */
 function switchView (name) {
+  /* P1: 切视图就作废所有在途的异步渲染，避免旧响应覆盖新页面 */
+  ++__viewToken
   /* B65: 离开预览页就作废，避免迟到的响应覆盖当前页面 */
   if (name !== 'preview' && name !== 'now' && name !== 'play') previewCtx = null
 
@@ -2616,6 +2670,7 @@ async function renderDownloadsView () {
   /* P3-2: 其它 render*View 都会复位 state.view，只有这个漏了。
      经 navGo（前进/后退）进来时没人写，导致下载成功后
      if (state.view === 'downloads') renderDownloadsView() 不触发。 */
+  const __vt = __viewToken    /* P1: 视图令牌，回来时校验是否还该渲染 */
   state.view = 'downloads'
   $$('.rail-item').forEach((b) => b.classList.toggle('active', b.dataset.view === 'downloads'))
   setViewTitle('下载管理', '')
@@ -2625,6 +2680,7 @@ async function renderDownloadsView () {
   let data = null
   try {
     data = await api('/api/downloads')
+    if (__vt !== __viewToken || state.view !== 'downloads') return
   } catch (e) {
     box.innerHTML = '<div class="empty-hint">读取失败：' + e.message + '</div>'
     return
@@ -2632,7 +2688,7 @@ async function renderDownloadsView () {
   const files = (data && data.files) || []
   const dir = (data && data.dir) || ''
   const head = `<div class="dl-bar">
-      <span class="dl-dir" title="${(data && data.dirs ? data.dirs.join(' | ') : dir)}">${data && data.dirs && data.dirs.length > 1 ? data.dirs.length + ' 个目录' : (dir || '未设置目录')}</span>
+      <span class="dl-dir" title="${esc(data && data.dirs ? data.dirs.join(' | ') : dir)}">${data && data.dirs && data.dirs.length > 1 ? data.dirs.length + ' 个目录' : esc(dir || '未设置目录')}</span>
       <button class="btn-mini" id="dlCopyDir">复制路径</button>
       <button class="btn-mini" id="dlRefresh">刷新</button>
     </div>`
@@ -2641,7 +2697,7 @@ async function renderDownloadsView () {
   } else {
     const rows = files.map((f, i) => `<tr data-name="${encodeURIComponent(f.name)}" data-dir="${encodeURIComponent(f.dir || '')}">
         <td class="idx">${i + 1}</td>
-        <td class="c-name">${f.name}<div class="c-dir">${f.dir || ''}</div></td>
+        <td class="c-name">${esc(f.name)}<div class="c-dir">${esc(f.dir || '')}</div></td>
         <td class="c-size">${(f.size / 1048576).toFixed(1)} MB</td>
         <td class="c-time">${new Date(f.mtime).toLocaleString('zh-CN', { hour12: false })}</td>
         <td class="c-act">

@@ -263,22 +263,12 @@
     }
 
     /* ② 回落：各平台直链 */
+    /* P1: 这个分支原来会先算一个 outer/url、调 NAPI.probe 做同步探活
+       （最长阻塞 JS 线程 28 秒），把结果存进 status/nativeOk/ct 三个变量，
+       然后无条件 throw —— 三个变量全部没人用，探活纯属白跑。
+       外链本身是 302 占位，播放必失败，所以直接失败即可。 */
     if (source === 'wy') {
-      const u = 'https://music.163.com/song/media/outer/url?id=' + encodeURIComponent(id) + '.mp3'
-      let status = 0
-      let nativeOk = false
-      let ct = ''
-      try {
-        if (window.NAPI && window.NAPI.probe) {
-          const raw = JSON.parse(window.NAPI.probe(u))
-          status = Number(raw && raw.status) || 0
-          nativeOk = raw && raw.ok === true
-          ct = String((raw && raw.type) || '')
-        }
-      } catch (e) { }
-      /* 外链占位不采用（302 到失效地址，播放必失败） */
       throw new Error('网易云外链不可用，换一首试试')
-      throw new Error('这首取不到播放地址（可能是 VIP 歌），换一首试试')
     }
 
     if (source === 'kg') {
@@ -954,9 +944,20 @@ async function mobileApi (path, opts = {}) {
   async function ensureScripts () {
     const M = window.LxScriptManager
     if (!M || !window.LX_SOURCES) return
-    if (M.ready) return
+    /* P2: ready=true 但 0 个脚本时也不能直接 return，否则首次加载失败后永久空 */
+    const alive = !!(M.scripts && M.scripts.size)
+    if (M.ready && alive) return
     if (!scriptsLoading) scriptsLoading = M.loadAll(pickSources())
-    try { await scriptsLoading } catch (e) {}
+    try {
+      await scriptsLoading
+    } catch (e) {
+      /* P1: 原来这里吞掉异常但不复位，下一次调用会 await 同一个已 rejected 的 Promise，
+         脚本永不重载 → 叠加「网易云分支必 throw」→ 所有网易云的歌都放不了，直到重启 App。 */
+      scriptsLoading = null
+    } finally {
+      /* 加载完但一个都没成时也复位，让下次能再试 */
+      if (!(M && M.scripts && M.scripts.size)) scriptsLoading = null
+    }
   }
   window.ensureScripts = ensureScripts
 
@@ -971,9 +972,14 @@ async function mobileApi (path, opts = {}) {
   window.mobileApi = function cachedMobileApi (path, opts = {}) {
     if (!String(path).startsWith('/api/url')) return __mobileApiRaw(path, opts)
     let key = ''
+    let qForce = false
     try {
       const u = new URL(path, 'http://m.local')
       const q = u.searchParams
+      /* P1: 允许前端用 &force=1 从外部失效缓存。
+         原来只认 opts.force/noCache，而前端三处 /api/url 调用都不传 opts，
+         CDN token 过期后「换个音源重试」永远拿回同一条死链。 */
+      qForce = q.get('force') === '1' || q.get('nocache') === '1'
       /* 缓存 key 必须包含所有参与取流的参数。
          只取 4 个字段会出两个 bug：
          1) format 没进 key → 播放缓存的 mp3 直链会被 FLAC 下载命中（下到 mp3 但文件名 .flac）
@@ -987,7 +993,7 @@ async function mobileApi (path, opts = {}) {
       return __mobileApiRaw(path, opts)
     }
     /* force / noCache：失败重试时必须能绕过缓存 */
-    const __force = !!(opts && (opts.force || opts.noCache))
+    const __force = qForce || !!(opts && (opts.force || opts.noCache))
     if (!__force) {
       const hit = __urlCache.get(key)
       if (hit && hit.exp > Date.now()) {
