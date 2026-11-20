@@ -197,7 +197,7 @@ function enhanceSelect (sel) {
 }
 
 /* ================= 版本与检查更新 ================= */
-const APP_VERSION = '1.0.29'
+const APP_VERSION = '1.0.30'
 const GH_OWNER = 'LORQAQ'
 const GH_REPO = 'phonograph'
 const GH_RELEASES = 'https://github.com/' + GH_OWNER + '/' + GH_REPO + '/releases/latest'
@@ -1318,7 +1318,9 @@ async function downloadSong (song) {
   try {
     const sp0 = songParams(song)
     sp0.set('save', '1')
-    r0 = await api('/api/download?' + sp0.toString())
+    /* P1: 服务端对 save=1 要求 POST（否则任何网页 <img src=...save=1> 就能往磁盘写文件）。
+       这里必须同步改成 POST —— 之前服务端改了、前端没改，会把电脑端下载直接打坏。 */
+    r0 = await api('/api/download?' + sp0.toString(), { method: 'POST', body: {} })
     if (r0 && r0.ok) {
       toast('已保存：' + r0.name + '（' + (r0.size / 1048576).toFixed(1) + ' MB）', 3600)
       state.downloads.unshift({ name: song.name, singer: song.singer, quality: state.quality, ts: Date.now(), path: r0.path })
