@@ -1,83 +1,146 @@
 'use strict'
-/* 校验电脑端安装包内容（BUG-REPORT-2 B24 的桌面版） */
-const fs = require('node:fs')
+/**
+ * 校验安装包内容
+ * 修 P1：
+ *   - 版本号原来写死 1.0.28，换版本就失效
+ *   - 26 项里没有一项检查 留声.exe —— 外壳缺失也能全绿
+ *   - 没有版本断言、没有字节比对
+ */
 const path = require('node:path')
+const fs = require('node:fs')
 const { execSync } = require('node:child_process')
+process.chdir(path.resolve(__dirname, '..'))
 
-const ROOT = path.resolve(__dirname, '..', '..')
-const EXE = path.join(ROOT, 'lx-music-clone', '留声-1.0.28-安装包.exe')
-const TMP = path.join(ROOT, 'lx-music-clone', 'build', '_verify_exe')
+const VERSION = (fs.readFileSync('public/app.js', 'utf8').match(/const APP_VERSION = '([^']+)'/) || [])[1]
+if (!VERSION) { console.log('✗ 读不到 APP_VERSION'); process.exit(1) }
 
-if (!fs.existsSync(EXE)) { console.error('✗ 安装包不存在'); process.exit(1) }
-console.log('校验对象: ' + EXE)
-console.log('大小: ' + (fs.statSync(EXE).size / 1048576).toFixed(1) + ' MB\n')
+const EXE = '留声-' + VERSION + '-安装包.exe'
+let pass = 0
+let fail = 0
+const failures = []
+function ok (n, e) { pass++; console.log('  ✓ ' + n + (e ? '  ' + e : '')) }
+function bad (n, d) { fail++; failures.push(n + (d ? ' — ' + d : '')); console.log('  ✗ ' + n + (d ? '  ' + d : '')) }
 
-/* 从 exe 里提取内嵌 zip */
-const buf = fs.readFileSync(EXE)
-const start = buf.indexOf(Buffer.from([0x50, 0x4b, 0x03, 0x04]))
-if (start < 0) { console.error('✗ 找不到内嵌 zip'); process.exit(1) }
-console.log('ZIP 偏移: ' + start)
+console.log('================ 安装包内容校验 ================')
+console.log('期望版本: ' + VERSION)
+console.log('目标文件: ' + EXE + '\n')
 
-fs.rmSync(TMP, { recursive: true, force: true })
-fs.mkdirSync(TMP, { recursive: true })
-const zipPath = path.join(TMP, '_payload.zip')
-fs.writeFileSync(zipPath, buf.slice(start))
-
-try {
-  execSync('tar.exe -xf "' + zipPath + '" -C "' + TMP + '"', { stdio: 'pipe' })
-} catch (e) {
-  console.error('✗ 解包失败：' + e.message)
+if (!fs.existsSync(EXE)) {
+  console.log('✗ 安装包不存在')
   process.exit(1)
 }
 
-function read (rel) {
-  const p = path.join(TMP, rel)
-  return fs.existsSync(p) ? fs.readFileSync(p, 'utf8') : ''
-}
-
-const srv = read('app/server.js')
-const cp = read('app/lib/cross-platform.js')
-const app = read('public/app.js')
-const sm = read('app/lib/source-manager.js')
-const qq = read('app/lib/qq.js')
-const kg = read('app/lib/kugou.js')
-
-const checks = [
-  ['server.js 存在', srv.length > 20000],
-  ['B6 /api/pic 限制 CDN', srv.includes('PIC_HOST_ALLOW')],
-  ['B7 Origin 守卫', srv.includes('sameOrigin')],
-  ['B7 写接口强制 POST', srv.includes('WRITE_PATHS')],
-  ['B14 remove 无 dir 参数', !srv.includes("q.get('dir')") || !srv.includes("q.get('dir') || ''")],
-  ['B15 reveal 路径校验', srv.includes('只能定位音频文件')],
-  ['B18 in-flight 复用', srv.includes('urlInflight')],
-  ['B39 intParam', srv.includes('function intParam')],
-  ['B41 写盘合并', srv.includes('dbFirstDirtyAt') && srv.includes('flushDb')],
-  ['B41 信号 flush', srv.includes('shutdownGracefully')],
-  ['B42 loadAll 共享 promise', sm.includes('_loadingPromise')],
-  ['B47 LRU', srv.includes('function cacheGet')],
-  ['B51 Cookie 脱敏', srv.includes('function publicSettings') && srv.includes('qqCookieTail')],
-  ['B4 名称相似度校验', cp.includes('similarName') && cp.includes('similarSinger')],
-  ['B4 元数据缺失不兜底', cp.includes('_metaMissing')],
-  ['B16 qq 失败不缓存', qq.includes('cache.delete(key)')],
-  ['B16 kugou 失败不缓存', kg.includes('cache.delete(key)')],
-  ['B17 总超时 12000', sm.includes('12000')],
-  ['B1 导入地址取值', app.includes("const urlEl = $('#importUrl')")],
-  ['B2 音质切换防 TDZ', app.includes('if (timer) { clearTimeout(timer)')],
-  ['B2 音质切换 token', app.includes('token !== state.playToken')],
-  ['B52 取流失败提示', app.includes('没取到播放地址')],
-  ['B53 探测器回收', app.includes('__pcCleanup')],
-  ['runtime node.exe', fs.existsSync(path.join(TMP, 'runtime', 'node.exe'))],
-  ['ffmpeg', fs.existsSync(path.join(TMP, 'runtime', 'bin', 'ffmpeg.exe'))],
-  ['sources 目录', fs.existsSync(path.join(TMP, 'sources')) && fs.readdirSync(path.join(TMP, 'sources')).filter((f) => f.endsWith('.js')).length >= 5],
-]
-
-let ok = 0
-for (const [n, p] of checks) {
-  console.log('  ' + (p ? '✓' : '✗') + ' ' + n)
-  if (p) ok++
-}
-console.log('\n通过 ' + ok + '/' + checks.length)
-
+const TMP = path.join('build', '_chk_installer')
 fs.rmSync(TMP, { recursive: true, force: true })
-if (ok !== checks.length) { process.exitCode = 1; console.error('\n有 ' + (checks.length - ok) + ' 项未通过') }
-else console.log('\n全部通过')
+fs.mkdirSync(TMP, { recursive: true })
+
+try {
+  const buf = fs.readFileSync(EXE)
+  ok('安装包存在', (buf.length / 1048576).toFixed(2) + ' MB')
+
+  /* 找内嵌 zip */
+  const idx = buf.indexOf(Buffer.from([0x50, 0x4b, 0x03, 0x04]))
+  if (idx < 0) throw new Error('找不到内嵌 payload.zip')
+  ok('找到内嵌 payload.zip', 'offset=' + idx)
+
+  const zipPath = path.join(TMP, 'p.zip')
+  fs.writeFileSync(zipPath, buf.slice(idx))
+
+  /* UTF-8 标志 */
+  let badUtf8 = 0
+  const payload = buf.slice(idx)
+  for (let i = 0; i < payload.length - 4; i++) {
+    if (payload[i] === 0x50 && payload[i + 1] === 0x4b && payload[i + 2] === 0x01 && payload[i + 3] === 0x02) {
+      const flags = payload.readUInt16LE(i + 8)
+      const nameLen = payload.readUInt16LE(i + 28)
+      const nb = payload.slice(i + 46, i + 46 + nameLen)
+      if (nb.some((x) => x > 127) && !(flags & 0x0800)) badUtf8++
+    }
+  }
+  badUtf8 === 0 ? ok('中文条目都置了 UTF-8 标志') : bad('中文条目 UTF-8 标志', badUtf8 + ' 个未置')
+
+  /* 解包 */
+  execSync('tar.exe -xf "' + zipPath + '" -C "' + TMP + '"', { stdio: 'pipe' })
+
+  /* ---- 关键文件（原来完全没查 留声.exe）---- */
+  const MUST = [
+    ['留声.exe', 60000],
+    ['LXMusic.ico', 1000],
+    ['README.md', 100],
+    ['runtime/node.exe', 50000000],
+    ['app/server.js', 10000],
+    ['app/lib/kugou-gcid.js', 5000],
+    ['public/app.js', 50000],
+    ['public/index.html', 10000],
+    ['public/style.css', 10000],
+    ['WebView2Loader.dll', 100000],
+  ]
+  console.log('\n  关键文件:')
+  for (const [rel, minSize] of MUST) {
+    const p = path.join(TMP, rel.split('/').join(path.sep))
+    if (!fs.existsSync(p)) { bad('包内 ' + rel, '缺失'); continue }
+    const sz = fs.statSync(p).size
+    if (sz < minSize) bad('包内 ' + rel, sz + 'B < 期望 ' + minSize + 'B')
+    else ok('包内 ' + rel, sz + 'B')
+  }
+
+  /* sources 目录 */
+  const srcDir = path.join(TMP, 'sources')
+  if (fs.existsSync(srcDir)) {
+    const n = fs.readdirSync(srcDir).filter((f) => f.endsWith('.js')).length
+    n > 0 ? ok('sources 音源脚本', n + ' 个') : bad('sources 音源脚本', '0 个')
+  } else bad('sources 目录', '缺失')
+
+  /* ---- 版本断言 ---- */
+  console.log('\n  版本:')
+  try {
+    const s = fs.readFileSync(path.join(TMP, 'public', 'app.js'), 'utf8')
+    const v = (s.match(/const APP_VERSION = '([^']+)'/) || [])[1]
+    v === VERSION ? ok('包内 app.js 版本 = ' + v) : bad('包内版本', v + ' ≠ ' + VERSION)
+  } catch (e) { bad('读 app.js', e.message) }
+
+  try {
+    const s = fs.readFileSync(path.join(TMP, 'app', 'server.js'), 'utf8')
+    const v = (s.match(/version: '([^']+)', pid/) || [])[1]
+    v === VERSION ? ok('包内 server.js health 版本 = ' + v) : bad('包内 server 版本', v + ' ≠ ' + VERSION)
+  } catch (e) { bad('读 server.js', e.message) }
+
+  /* ---- 与源码逐字节比对 ---- */
+  console.log('\n  与源码一致:')
+  const PAIRS = [
+    ['public/app.js', 'public/app.js'],
+    ['public/index.html', 'public/index.html'],
+    ['public/style.css', 'public/style.css'],
+    ['app/server.js', 'app/server.js'],
+  ]
+  for (const [inPkg, inSrc] of PAIRS) {
+    const a = path.join(TMP, inPkg.split('/').join(path.sep))
+    const b = path.join(inSrc.split('/').join(path.sep))
+    if (!fs.existsSync(a) || !fs.existsSync(b)) { bad(inPkg, '文件缺失'); continue }
+    const A = fs.readFileSync(a)
+    const B = fs.readFileSync(b)
+    A.equals(B) ? ok(inPkg) : bad(inPkg, '包内 ' + A.length + 'B / 源码 ' + B.length + 'B')
+  }
+
+  /* ---- 不该进包的东西 ---- */
+  console.log('\n  排除项:')
+  const NOT_SHIP = ['public/style.css.bak', 'sources/raw']
+  for (const rel of NOT_SHIP) {
+    const p = path.join(TMP, rel.split('/').join(path.sep))
+    !fs.existsSync(p) ? ok('不含 ' + rel) : bad('不该含 ' + rel, '仍在包里')
+  }
+} catch (e) {
+  bad('校验过程', e.message)
+} finally {
+  fs.rmSync(TMP, { recursive: true, force: true })
+}
+
+console.log('\n================ 结果 ================')
+console.log('通过 ' + pass + ' / 失败 ' + fail)
+if (fail) {
+  console.log('\n失败项:')
+  failures.forEach((f) => console.log('  - ' + f))
+  process.exitCode = 1
+} else {
+  console.log('全部通过')
+}

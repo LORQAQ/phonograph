@@ -31,7 +31,9 @@ namespace PhonographSetup
                 string self = Assembly.GetExecutingAssembly().Location;
                 string tmp = Path.Combine(Path.GetTempPath(), "phonograph-uninstall.exe");
                 try { File.Copy(self, tmp, true); } catch { }
-                Process.Start(tmp, "--purge \"" + DefaultDir + "\"");
+                /* P1: 原来永远清 DefaultDir，用户装到自定义目录后卸载会留下 170MB 残骸 */
+                string real = ReadInstallLocation() ?? DefaultDir;
+                Process.Start(tmp, "--purge \"" + real + "\"");
                 return;
             }
             if (args.Length >= 1 && args[0] == "--silent")
@@ -40,14 +42,70 @@ namespace PhonographSetup
                 try
                 {
                     SetupCore.InstallTo(dir, null);
+                    /* 成功也要确认外壳真的落盘了，而不是只信解包没抛异常 */
+                    string appExe = Path.Combine(dir, "留声.exe");
+                    if (!File.Exists(appExe)) throw new Exception("安装后找不到 留声.exe");
                     Console.WriteLine("OK " + dir);
                 }
-                catch (Exception ex) { Console.WriteLine("ERR " + ex.GetType().Name + " :: " + ex.Message + "\n" + ex.StackTrace); }
+                catch (Exception ex)
+                {
+                    Console.WriteLine("ERR " + ex.GetType().Name + " :: " + ex.Message);
+                    /* P1: 静默模式失败必须让调用方看得见 —— 原来恒返回 0 */
+                    Environment.ExitCode = 1;
+                }
                 return;
             }
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             Application.Run(new SetupForm());
+        }
+
+        /** 从注册表读实际安装目录；读不到就返回 null */
+        static string ReadInstallLocation()
+        {
+            try
+            {
+                using (var k = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(
+                    @"Software\Microsoft\Windows\CurrentVersion\Uninstall\Phonograph"))
+                {
+                    if (k == null) return null;
+                    var v = k.GetValue("InstallLocation") as string;
+                    return string.IsNullOrEmpty(v) ? null : v;
+                }
+            }
+            catch { return null; }
+        }
+
+        /** 覆盖安装前确认程序没在跑，否则会解出「旧文件 + 新文件」的混合目录 */
+        public static void EnsureNotRunning()
+        {
+            bool running = false;
+            try
+            {
+                foreach (var p in Process.GetProcessesByName("留声")) { running = true; break; }
+            }
+            catch { }
+            if (!running)
+            {
+                try
+                {
+                    foreach (var p in Process.GetProcessesByName("node"))
+                    {
+                        try
+                        {
+                            if (p.MainModule != null && p.MainModule.FileName != null &&
+                                p.MainModule.FileName.IndexOf("Phonograph", StringComparison.OrdinalIgnoreCase) >= 0)
+                            { running = true; break; }
+                        }
+                        catch { }
+                    }
+                }
+                catch { }
+            }
+            if (running)
+            {
+                throw new Exception("留声正在运行，请先退出程序再安装（含右下角托盘图标）");
+            }
         }
 
         static void Purge(string dir)
@@ -56,11 +114,42 @@ namespace PhonographSetup
             try
             {
                 foreach (var p in Process.GetProcessesByName("留声")) { try { p.Kill(); } catch { } }
-                foreach (var p in Process.GetProcessesByName("node")) { }
+                /* P1: 原来这里是个空循环体 —— node.exe 根本不会被杀，
+                   它持有 data\*.db.json 和 runtime\node.exe，目录删不掉，异常又被下面的 catch 吞了。 */
+                foreach (var p in Process.GetProcessesByName("node"))
+                {
+                    try
+                    {
+                        /* 只杀本程序的 node（服务端口 37621 的监听者） */
+                        if (p.MainModule != null && p.MainModule.FileName != null &&
+                            p.MainModule.FileName.IndexOf("Programs\\Phonograph", StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            p.Kill();
+                            p.WaitForExit(3000);
+                        }
+                    }
+                    catch { }
+                }
                 Thread.Sleep(600);
-                if (Directory.Exists(dir)) Directory.Delete(dir, true);
+                if (Directory.Exists(dir))
+                {
+                    /* 重试 3 次，还不行就留个说明，别静默留残骸 */
+                    for (int i = 0; i < 3; i++)
+                    {
+                        try { Directory.Delete(dir, true); break; }
+                        catch { Thread.Sleep(700); }
+                    }
+                }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                try
+                {
+                    File.WriteAllText(Path.Combine(Path.GetTempPath(), "phonograph-uninstall-error.txt"),
+                        "无法删除安装目录：" + dir + "\n" + ex.Message);
+                }
+                catch { }
+            }
             try
             {
                 string desk = Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
@@ -85,6 +174,7 @@ namespace PhonographSetup
     {
         public static void InstallTo(string dir, Action<int, string> progress)
         {
+            Program.EnsureNotRunning();
             Directory.CreateDirectory(dir);
             var asm = Assembly.GetExecutingAssembly();
             using (var s = asm.GetManifestResourceStream("payload.zip"))

@@ -73,8 +73,18 @@ const fmtTime = (sec) => {
   return String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0')
 }
 
+/* P2: 上游偶尔把 singer 给成字符串、或列表里混进 null，
+   原来一句 .map 就抛 TypeError → 整个搜索接口 500。 */
+function toArr (v) {
+  if (Array.isArray(v)) return v.filter((x) => x && typeof x === 'object')
+  if (v && typeof v === 'object') return [v]
+  if (typeof v === 'string' && v) return [{ name: v }]
+  return []
+}
+
 function mapSong (s) {
-  const singer = (s.singer || []).map((x) => x.name).join(' / ')
+  if (!s || typeof s !== 'object') return null
+  const singer = toArr(s.singer).map((x) => x.name).filter(Boolean).join(' / ')
   const mid = s.songmid || s.mid
   const interval = s.interval || 0
   const albumMid = s.albummid || (s.album && s.album.mid) || ''
@@ -118,7 +128,7 @@ async function search (keyword, page = 1, limit = 30) {
     const song = body && body.data && body.data.song
     const list = (song && song.list) || []
     if (!list.length) throw new Error('QQ 音乐未搜索到结果（接口可能临时限流，请稍后重试）')
-    return { total: song.totalnum || list.length, list: list.map(mapSong) }
+    return { total: song.totalnum || list.length, list: list.map(mapSong).filter(Boolean) }
   })
 }
 

@@ -252,6 +252,9 @@
         }
         const hit = await M.resolve(source, mi, quality, '')
         /* 不支持格式过滤 */
+      /* P2: 脚本返回 .aac/.wma 时 WebView 播不了，但这条主路径没做过滤 ——
+         与 resolveUrl 里的过滤自相矛盾。 */
+      if (hit && hit.url && badFormat(hit.url)) { hit.url = '' }
         if (hit && hit.url) {
           const uu = String(hit.url).toLowerCase()
           /* 裸 aac/wma 在 WebView 播不了，跳过换下一个音源 */
@@ -809,11 +812,7 @@ async function mobileApi (path, opts = {}) {
           }
           throw new Error('歌单不存在：' + listId)
         }
-        if (action === 'remove') {
-          const pl = d.playlists.find((x) => x.id === body.id)
-          if (pl) pl.songs = pl.songs.filter((s) => String(s.id) !== String(body.songId))
-          saveDb(d); return { playlists: d.playlists }
-        }
+    /* P3: 这里原来有一份永不可达的 remove 重复实现，已删 */
         if (action === 'clear') {
           const pl = d.playlists.find((x) => x.id === body.id)
           if (pl) pl.songs = []
@@ -862,6 +861,8 @@ async function mobileApi (path, opts = {}) {
             code = r.body
           }
           if (!code) throw new Error('缺少脚本内容')
+    /* P2: 另一条路由 /api/sources/import 有 2MB 上限，这条没有 —— 塞个 3MB 混淆脚本会卡死主线程 */
+    if (code.length > 2 * 1024 * 1024) throw new Error('脚本体过大（上限 2MB）')
           const id = 'custom_' + Date.now().toString(36)
           return { list: await M.addCode(id, code, body.name) }
         }
@@ -941,7 +942,12 @@ async function mobileApi (path, opts = {}) {
     console.log('[音源] 候选', all.length, '个，选用', picked.length, '个：', picked.map((s) => s.id).join(','))
     return picked.length ? picked : all
   }
-  async function ensureScripts () {
+  /** 裸 aac/wma/ape/cue 在 WebView 里播不了（会报 Format error code 4） */
+function badFormat (u) {
+  return /\.(aac|wma|ape|cue)(\?|$)/i.test(String(u || ''))
+}
+
+async function ensureScripts () {
     const M = window.LxScriptManager
     if (!M || !window.LX_SOURCES) return
     /* P2: ready=true 但 0 个脚本时也不能直接 return，否则首次加载失败后永久空 */

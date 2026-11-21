@@ -41,7 +41,22 @@ html = html.replace(/(<script src="app\.js(\?[^"]*)?"><\/script>)/,
 // 去掉移动端 service worker 注册（file:// 下不可用）
 html = html.replace(/<script>\s*if \('serviceWorker'[\s\S]*?<\/script>/, '')
 
-fs.writeFileSync(path.join(WWW, 'index.html'), html, 'utf8')
+/* P1: index.html 的替换原来全是裸 replace，锚点一变就是 no-op，
+         产物仍是 <script src="/app.js"> 且不注入 8 个必需脚本 —— 白屏包，而旧验证全绿。 */
+    function assertHtml (h) {
+      const errs = []
+      if (/src="\/app\.js/.test(h)) errs.push('app.js 还是绝对路径')
+      if (/href="\/style\.css/.test(h)) errs.push('style.css 还是绝对路径')
+      const need = ['api-mobile.js', 'sources-data.js', 'lib/lx-engine-web.js', 'lib/native-http.js', 'lib/music-libs.js']
+      for (const n of need) {
+        if (!h.includes('src="' + n + '"')) errs.push('没注入 ' + n)
+      }
+      if (errs.length) {
+        throw new Error('index.html 组装失败：\n  - ' + errs.join('\n  - '))
+      }
+    }
+    assertHtml(html)
+    fs.writeFileSync(path.join(WWW, 'index.html'), html, 'utf8')
 
 // 3) app.js 里移动端特判：禁止再用绝对 /api/ 图片路径（file:// 下会失败）
 //

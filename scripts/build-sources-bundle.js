@@ -7,7 +7,10 @@ const ROOT = path.resolve(__dirname, '..')
 const SRC = path.join(ROOT, 'sources')
 const OUT = path.join(ROOT, 'mobile', 'www', 'sources-data.js')
 
-const files = fs.readdirSync(SRC).filter((f) => f.endsWith('.js'))
+/* P1: 手机端不能用这几个 —— xingkong 在手机上 init 会同步卡死。
+   生成器原来没有黑名单，重跑一次就会把这个源塞回手机包。 */
+const MOBILE_EXCLUDE = ['xingkong']
+const files = fs.readdirSync(SRC).filter((f) => f.endsWith('.js')).filter((f) => !MOBILE_EXCLUDE.includes(f.replace(/\.js$/i, '')))
 const items = files.map((f) => ({
   id: f.replace(/\.js$/, ''),
   code: fs.readFileSync(path.join(SRC, f), 'utf8'),

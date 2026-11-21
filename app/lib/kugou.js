@@ -47,7 +47,9 @@ function coverOf (s) {
   return String(uri).replace('{size}', '300')
 }
 
+/* P2: 条目可能是 null */
 function mapSong (s) {
+  if (!s || typeof s !== 'object') return null
   const hash = s.hash || s.FileHash || ''
   return {
     id: String(hash),

@@ -1,0 +1,10 @@
+using System.Reflection;
+
+[assembly: AssemblyTitle("留声 Phonograph")]
+[assembly: AssemblyDescription("留声 · 桌面音乐播放器")]
+[assembly: AssemblyProduct("留声 Phonograph")]
+[assembly: AssemblyCompany("LORQAQ")]
+[assembly: AssemblyCopyright("")]
+[assembly: AssemblyVersion("VERSION_PLACEHOLDER")]
+[assembly: AssemblyFileVersion("VERSION_PLACEHOLDER")]
+[assembly: AssemblyInformationalVersion("VERSION_PLACEHOLDER")]

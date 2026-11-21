@@ -27,8 +27,9 @@ const cache = new Map()
 function cached (key, ttl, fn) {
   const hit = cache.get(key)
   if (hit && hit.exp > Date.now()) return hit.value
-  const p = fn()
-  cache.set(key, { value: p, exp: Date.now() + ttl })
+  /* P2: 原来把 rejected Promise 也缓存住 —— 一次网络抖动会锁死整个 TTL（酷狗歌词 30 分钟）。
+     只缓存成功的值。 */
+  const p = fn().catch((e) => { cache.delete(key); throw e })
   if (cache.size > 300) cache.delete(cache.keys().next().value)
   return p
 }

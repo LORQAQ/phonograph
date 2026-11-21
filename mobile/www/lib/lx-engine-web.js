@@ -220,9 +220,20 @@
       timeout = timeout || 20000
       return new Promise((resolve, reject) => {
         let settled = false
+        /* P2: 全局还原必须覆盖所有出口（成功/失败/超时）。
+           原来只有一个 100ms 定时器，而脚本是异步 inited，那时 settled 仍为 false → 永不还原。 */
+        const prevLx0 = globalThis.lx
+        const prevBuf0 = globalThis.Buffer
+        const restoreGlobals = () => {
+          /* 只在全局仍指向本脚本时才还原，避免把别的脚本的 lx 覆盖掉 */
+          try { if (lx0 && globalThis.lx === lx0) globalThis.lx = prevLx0 } catch (e) { }
+          try { globalThis.Buffer = prevBuf0 } catch (e) { }
+        }
+        let lx0 = null
         const timer = setTimeout(() => {
           if (settled) return
           settled = true
+              restoreGlobals()
           reject(new Error('脚本初始化超时'))
         }, timeout)
 
@@ -240,6 +251,7 @@
               if (!data || !data.sources) { reject(new Error('inited 缺少 sources')); return }
               self.sources = data.sources
               self.inited = true
+              restoreGlobals()
               resolve(data)
             } else if (ev === EVENT_NAMES.updateAlert) {
               self.alert = data
@@ -248,10 +260,12 @@
           request,
           utils: createUtils(),
         }
+        lx0 = lx
 
         const prevLx = globalThis.lx
         globalThis.lx = lx
         const __prevBuffer = globalThis.Buffer
+      const prevBufferSnapshot = globalThis.Buffer    /* P2: 无论原来有没有，都按原值还原 */
       globalThis.Buffer = Buf
         globalThis.atob = atob
         globalThis.btoa = btoa
@@ -280,11 +294,15 @@
           settled = true
           clearTimeout(timer)
           this.error = '脚本执行异常: ' + e.message
+              restoreGlobals()
           reject(new Error(this.error))
         }
-        // 脚本同步初始化失败时恢复
-        setTimeout(() => { if (settled && globalThis.lx === lx) globalThis.lx = prevLx
-        try { if (typeof __prevBuffer !== 'undefined') globalThis.Buffer = __prevBuffer } catch (e) { } }, 100)
+        /* P2: 原来的恢复逻辑有两个缺陷：
+           1) 用 100ms 的一次性定时器，而脚本普遍是异步 send('inited')（>100ms），
+              那时 settled 仍为 false → 永久跳过
+           2) Buffer 的恢复被 typeof 判断卡死 —— 页面本来就没有 Buffer，
+              __prevBuffer 必为 undefined，条件恒 false
+           改成：settled 之后无条件按原值还原。 */
       })
     }
 
@@ -413,7 +431,8 @@
       const isDisabled = (id) => this.disabled && this.disabled.has && this.disabled.has(id)
       /* P1-B: 不回退到「全部脚本」。only 指定的源不可用就应该明确失败，
          交给上层跨平台兜底，而不是静默换源假装成功。 */
-      const list = want.map((id) => this.scripts.get(id)).filter((e) => e && !isDisabled(e.id))
+    /* P3: fish 上面已经串行试过 3 次，这里再塞进并发竞速就是第 4 次调用 */
+    const list = want.filter((id) => id !== 'fish').map((id) => this.scripts.get(id))
       if (!list.length) {
         /* P1-B: 没有可用音源时明确返回 null，别偷偷换成全部脚本 */
         return null

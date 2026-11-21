@@ -191,8 +191,14 @@ function enhanceSelect (sel) {
 
   wrap.appendChild(btn)
   wrap.appendChild(panel)
-  document.addEventListener('click', () => panel.classList.remove('show'))
-  setInterval(sync, 500)
+  /* P3: 每个 select 都加一个 document 监听，7 个就 7 个。改成一个全局的。 */
+  if (!window.__ddDocBound) {
+    window.__ddDocBound = true
+    document.addEventListener('click', () => document.querySelectorAll('.dd-panel.show').forEach((p) => p.classList.remove('show')))
+  }
+  /* P3: 原来是 setInterval(sync, 500)，永不清理 —— boot 后常驻两个 interval。
+     改成事件驱动：值变化时才同步（下拉点选时本来就手动调了 sync）。 */
+  sel.addEventListener('change', sync)
   sync()
 }
 
@@ -374,6 +380,7 @@ function loadSettings () {
   state.speed = typeof s.speed === 'number' ? s.speed : 1
   state.themeFromCover = !!s.themeFromCover
   state.dlFormat = s.dlFormat === 'flac' ? 'flac' : 'mp3'
+  state.settings = s    /* P3: 之前只摊平赋值，state.settings 永远是 null */
   setThemeMode(s.themeMode || 'light', false)
   const accent = (!s.theme || s.theme === '#c8a061' || s.theme === '') ? '#1f9d55' : s.theme
   setTheme(accent, false)
@@ -510,7 +517,8 @@ async function boot () {
   bindEvents()
   loadQueue()
   /* P2-1: 单个接口失败不能让整页变「初始化失败」 */
-  try { await loadPlaylists() } catch (e) { console.warn('[boot] loadPlaylists', e && e.message) }
+    /* P3: 只 warn 的话用户会看到「没有歌单」，以为数据被清空了 */
+    toast('歌单加载失败：' + ((e && e.message) || '网络异常') + '，可点右上角重试', 5000)
   try { await loadSources() } catch (e) { console.warn('[boot] loadSources', e && e.message) }
   renderLibraryView()
   nav.stack = [{ view: 'playlist' }]
@@ -587,6 +595,12 @@ function bindEvents () {
   $('#btnMode').onclick = cycleMode
   $('#btnSpeed').onclick = cycleSpeed
   $('#btnMute').onclick = toggleMute
+  /* P3: 底栏封面 CSS 做成了可点外观（cursor:pointer + hover 出歌词图标），
+     但从来没有绑定，点了什么都不发生。 */
+  {
+    const __cb = $('#coverBox')
+    if (__cb) __cb.onclick = () => { const ly = $('#lyricLayer'); if (ly) ly.classList.toggle('show') }
+  }
   $('#btnLike').onclick = () => state.currentSong && addToPlaylist(state.currentSong, 'default', true)
   $('#btnDownload').onclick = () => state.currentSong && downloadSong(state.currentSong)
   $('#btnDesktop').onclick = openDesktopLyric
@@ -776,10 +790,24 @@ function setVolume (v, silent) {
   if (!silent) saveSettings()
 }
 function toggleMute () {
-  state.muted = !state.muted
-  audio.muted = state.muted
-  $('#btnMute').innerHTML = svg(state.muted ? 'i-mute' : 'i-volume')
-  toast(state.muted ? '已静音' : '取消静音', 1200)
+  /* P3: 音量拖到 0 时 setVolume 会把 muted 置 true，此时再「取消静音」
+     只翻 muted 不动 volume → 仍然一点声音都没有，用户以为坏了。 */
+  const vol = Number(audio.volume) || 0
+  const muted = !!state.muted
+  if (muted || vol === 0) {
+    const target = vol > 0 ? vol : (state.volume > 0 ? state.volume : 0.8)
+    state.muted = false
+    audio.muted = false
+    setVolume(target)
+    toast('取消静音', 1200)
+  } else {
+    state.muted = true
+    audio.muted = true
+    toast('已静音', 1200)
+  }
+  const b = $('#btnMute')
+  if (b) b.innerHTML = svg(state.muted ? 'i-mute' : 'i-volume')
+  saveSettings()
 }
 
 /* ================= 播放核心 ================= */
@@ -790,7 +818,7 @@ function songParams (song, only) {
     interval: song.durationText || '', mediaMid: song.mediaMid || '',
   })
   if (only) p.set('only', only)
-  if (typeof state.dlFormat === 'string') p.set('format', state.dlFormat)
+  /* P3: format 只有下载用得上，播放/测速不需要。放进 songParams 会让播放缓存键被下载格式污染。 */
   return p
 }
 function coverUrl (song) {
@@ -817,13 +845,22 @@ function setSrc (text) {
 const __urlCache = new Map()
 const URL_TTL = 5 * 60 * 1000
 
+const __srcInflight = new Map()
 async function streamSrc (song, only, forceFresh) {
-  const ck = song.source + '|' + song.id + '|' + (only || '') + '|' + state.quality + '|' + state.dlFormat
+  /* P3: 缓存键去掉 dlFormat —— 在下载弹窗选一次 FLAC 不该让所有播放缓存失效 */
+  const ck = song.source + '|' + song.id + '|' + (only || '') + '|' + state.quality
   const hit = __urlCache.get(ck)
   if (!forceFresh && hit && hit.exp > Date.now()) return hit.url
-  const url = await __streamSrcInner(song, only, forceFresh)
-  if (url) __urlCache.set(ck, { url, exp: Date.now() + URL_TTL })
-  return url
+  /* P3: 双击同一首歌会并发两次取流，第一份结果被 playToken 丢掉、白跑一次音源探测 */
+  const ikey = ck + '|' + (forceFresh ? 'f' : '')
+  if (__srcInflight.has(ikey)) return __srcInflight.get(ikey)
+  const job = (async () => {
+    const url = await __streamSrcInner(song, only, forceFresh)
+    if (url) __urlCache.set(ck, { url, exp: Date.now() + URL_TTL })
+    return url
+  })().finally(() => __srcInflight.delete(ikey))
+  __srcInflight.set(ikey, job)
+  return job
 }
 
 async function __streamSrcInner (song, only, forceFresh) {
@@ -1317,6 +1354,7 @@ async function downloadSong (song) {
   try {
     const sp0 = songParams(song)
     sp0.set('save', '1')
+    sp0.set('format', state.dlFormat)    /* 下载才带 format */
     /* P1: 服务端对 save=1 要求 POST（否则任何网页 <img src=...save=1> 就能往磁盘写文件）。
        这里必须同步改成 POST —— 之前服务端改了、前端没改，会把电脑端下载直接打坏。 */
     r0 = await api('/api/download?' + sp0.toString(), { method: 'POST', body: {} })
@@ -1606,22 +1644,6 @@ function renderRecommendView () {
 
 /* 推荐歌单操作弹窗 */
 let pendingRec = null
-function openRecDialog (ds) {
-  /* 推荐弹窗里的「导入到我的歌单」按钮一直没绑，点了没反应 */
-  const __ri = $('#btnRecImport')
-  if (__ri) {
-    __ri.onclick = () => {
-      const p2 = pendingRec
-      try { $('#overlayRec').classList.remove('show') } catch (e) { }
-      if (p2 && p2.id) importFromCard(p2.platform, p2.id)
-    }
-  }
-  pendingRec = { platform: ds.platform, id: ds.id }
-  $('#recDialogCover').src = ds.cover || ''
-  $('#recDialogName').textContent = ds.name || ''
-  $('#recDialogMeta').textContent = (Number(ds.count) || 0) + ' 首 · ' + fmtCount(ds.play) + ' 播放'
-  $('#overlayRec').classList.add('show')
-}
 
 /* 预览推荐歌单（不导入，先看歌） */
 function playlistUrlOf (platform, id) {
@@ -2126,7 +2148,7 @@ async function addToPlaylist (song, listId, tip) {
 }
 async function removeFromPlaylist (listId, song) {
   try {
-    const data = await api('/api/playlist', { method: 'POST', body: { action: 'remove', listId, id: song.id } })
+    const data = await api('/api/playlist', { method: 'POST', body: { action: 'remove', listId, id: song.id, source: song.source } })
     state.playlists = data.playlists
     renderRailPlaylists()
     if (state.view === 'playlist') renderPlaylistView(listId)
@@ -2483,9 +2505,12 @@ function renderSettingsPane () {
       try {
         const r = await api('/api/download-dir?set=' + encodeURIComponent(v), { method: 'POST' })
         $('#dlDir').value = r.dir
-        /* 服务端新增：目录建不出来/不可写时会直接返回 400，
-           所以走到这里就是真的成功了，不再需要 writable 判断 */
-        toast('下载目录已设为：' + r.dir, 2600)
+        /* 目录建不出来时服务端返回 400；走到这里是保存成功。
+           写探测失败只做提示，不阻止保存 —— 探测会误报
+           （杀软/受控文件夹/沙箱都可能让 open 拿到 EPERM），
+           而真实下载走的是另一条路径。 */
+        if (r && r.writable === false) toast('已设为：' + r.dir + '（现在可能写不进去：' + (r.reason || '权限不足') + '）', 5000)
+        else toast('下载目录已设为：' + r.dir, 2600)
       } catch (e) {
         /* 目录不可用是用户输入问题，不是程序故障，措辞要说清楚 */
         const m = String(e.message || e)
@@ -2595,8 +2620,9 @@ if (data.startsWith('openUrlFail:')) {
     const inp = $('#dlDir')
     if (inp) inp.value = dir
     api('/api/download-dir?set=' + encodeURIComponent(dir), { method: 'POST' }).then((r) => {
-      /* 服务端不可写时会直接 400，走到这里就是成功 */
-      toast('下载目录已设为：' + dir, 3000)
+      /* 建不出来服务端会 400；这里是保存成功，写探测失败只提示 */
+      if (r && r.writable === false) toast('已设为：' + dir + '（现在可能写不进去：' + (r.reason || '权限不足') + '）', 5000)
+      else toast('下载目录已设为：' + dir, 3000)
     }).catch((e) => {
       const m = String(e.message || e)
       if (/目录|EPERM|EACCES|ENOENT|EEXIST|不可写/.test(m)) toast('目录不可用：' + m, 4200)
@@ -2790,3 +2816,16 @@ if ('serviceWorker' in navigator && /Android|iPhone|iPad|iPod|Mobile/i.test(navi
     navigator.serviceWorker.register('/sw.js').catch(() => {})
   })
 }
+
+
+/* P3: index.html 里的红色调试错误条对普通用户是噪音。
+   只在 URL 带 ?debug=1 时显示；正式使用只看 toast。 */
+;(function __errBarGuard () {
+  if (/[?&]debug=1/.test(location.search)) return
+  const hide = () => {
+    const b = document.getElementById('__errBar')
+    if (b) b.style.display = 'none'
+  }
+  hide()
+  setInterval(hide, 1000)
+})()

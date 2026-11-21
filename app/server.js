@@ -353,6 +353,34 @@ function defaultDownloadDir () {
   return path.join(home, 'Downloads', 'Liusheng')
 }
 
+/* 错误消息归一：Node 的 message 里通常已经带了 code，别再重复拼一遍 */
+function cleanErr (e) {
+  const code = (e && e.code) || ''
+  const msg = String((e && e.message) || e || '')
+  if (!code) return msg
+  if (msg.startsWith(code)) return msg
+  return code + ': ' + msg
+}
+
+/* 写探测：只用来提示用户，不用来阻止保存。
+   实测会误报 —— Node 在某些环境（杀软/受控文件夹/沙箱）下对完全正常的目录
+   也会在 open 时拿到 EPERM，而 access(W_OK) 却说可写。 */
+function probeWritable (dir) {
+  /* 先用 access 做一次便宜判断 */
+  let accessOk = true
+  try { fs.accessSync(dir, fs.constants.W_OK) } catch (e) { accessOk = false }
+  /* 再实测写一个小文件（更可靠），失败时清理 */
+  const probe = path.join(dir, '.liusheng_write_test')
+  try {
+    fs.writeFileSync(probe, 'ok')
+    try { fs.unlinkSync(probe) } catch (e2) { }
+    return { ok: true }
+  } catch (e) {
+    try { fs.unlinkSync(probe) } catch (e2) { }
+    return { ok: false, reason: (e.code || 'ERR') + ': ' + String(e.message || '').replace(/^[A-Z]+:\s*/, '') }
+  }
+}
+
 function proxyStream (req, res, targetUrl, opts = {}) {
   let u
   try { u = new URL(targetUrl) } catch (e) { return json(res, 400, { error: '无效的音频地址' }) }
@@ -668,45 +696,41 @@ const routes = {
         return { dir: d, writable: true, default: d, reset: true }
       }
       const dir = set.trim()
-      /* 先建目录。建不出来就直接报错，别把这个坏路径存进 db ——
-         否则用户看到「已保存」，之后每次下载都失败，还找不到原因。 */
+      /* 先建目录。建不出来就报错（这才是真的不可用）——
+         但注意：只拦「建不出来」，不拦「写探测失败」。
+         写探测会误报（杀软/受控文件夹/临时锁/沙箱都可能导致 EPERM），
+         而真实下载走的是另一条路径。用探测结果去阻止保存会让正常目录被拒。 */
       let mkErr = ''
       try {
         fs.mkdirSync(dir, { recursive: true })
+        /* 确认它真的是目录 —— 如果同名文件存在，mkdir 会静默成功 */
+        const st = fs.statSync(dir)
+        if (!st.isDirectory()) mkErr = '该路径已存在且不是文件夹'
       } catch (e) {
-        mkErr = (e.code || '') + (e.code ? ': ' : '') + e.message
+        mkErr = cleanErr(e)
       }
       if (mkErr) {
-        throw Object.assign(new Error('目录无法创建（' + mkErr + '）'), { code: 400 })
+        throw Object.assign(new Error('目录无法使用（' + mkErr + '）'), { code: 400 })
       }
-      /* 再实测可写 */
-      let writable = true
-      let errMsg = ''
-      try {
-        const probe = path.join(dir, 'w_test.tmp')
-        fs.writeFileSync(probe, 'ok')
-        fs.unlinkSync(probe)
-      } catch (e) {
-        writable = false
-        errMsg = (e.code || '') + (e.code ? ': ' : '') + e.message
-      }
-      /* 不可写也不保存 —— 存了也用不了 */
-      if (!writable) {
-        throw Object.assign(new Error('目录不可写（' + errMsg + '）'), { code: 400 })
-      }
+      /* 写探测：只用来给用户提示，不阻止保存 */
+      const probe = probeWritable(dir)
       db.settings.downloadDir = dir
       saveDb()
-      return { dir, writable: true, default: defaultDownloadDir() }
+      return { dir, writable: probe.ok, reason: probe.reason || undefined, default: defaultDownloadDir() }
     }
     const dir = db.settings.downloadDir || defaultDownloadDir()
     let writable = true
+    let reason
     try {
       fs.mkdirSync(dir, { recursive: true })
-      const probe = path.join(dir, 'w_test.tmp')
-      fs.writeFileSync(probe, 'ok')
-      fs.unlinkSync(probe)
-    } catch (e) { writable = false }
-    return { dir, writable, default: defaultDownloadDir() }
+      const p = probeWritable(dir)
+      writable = p.ok
+      reason = p.reason
+    } catch (e) {
+      writable = false
+      reason = (e.code || '') + ': ' + e.message
+    }
+    return { dir, writable, reason, default: defaultDownloadDir() }
   },
 
   /* 已下载文件列表：扫所有候选目录 */
@@ -1032,6 +1056,9 @@ const routes = {
 
   async '/api/sources/toggle' (req, q, res, body) {
     const { id, enabled } = body || {}
+    /* P3: id 缺失时会把 undefined 塞进 disabledSources，落盘成 null 后永久脏数据 */
+    if (!id || typeof id !== 'string') throw Object.assign(new Error('缺少音源 id'), { code: 400 })
+    if (!sourceManager.entries.has(id)) throw Object.assign(new Error('音源不存在'), { code: 404 })
     const disabled = new Set(db.settings.disabledSources || [])
     if (enabled) disabled.delete(id); else disabled.add(id)
     db.settings.disabledSources = [...disabled]
@@ -1124,7 +1151,7 @@ const routes = {
       if (!url) throw Object.assign(new Error('缺少歌单链接'), { code: 400 })
       const r = await importPlaylist(url)
       const pl = {
-        id: 'pl' + Date.now(),
+        id: 'pl' + Date.now() + '-' + require('node:crypto').randomBytes(3).toString('hex'),
         name: r.name || '导入歌单',
         songs: r.songs || [],
         platform: r.platform,
@@ -1135,13 +1162,19 @@ const routes = {
       return { playlists: db.playlists, imported: { id: pl.id, name: pl.name, count: pl.songs.length, total: r.total, truncated: !!r.truncated, timedOut: !!r.timedOut, skipped: r.skipped || 0, platform: r.platform } }
     }
     if (action === 'create') {
-      const p = { id: 'pl' + Date.now(), name: (b && b.name) || '新建歌单', songs: [] }
+      const p = { id: 'pl' + Date.now() + '-' + require('node:crypto').randomBytes(3).toString('hex'), name: (b && b.name) || '新建歌单', songs: [] }
       db.playlists.push(p); saveDb()
       return { playlists: db.playlists, id: p.id }
     }
     if (action === 'rename') {
+      /* P2: 原来不校验 name。空值时 name 被赋成 undefined，
+         JSON.stringify 会丢掉这个键 → 歌单名彻底消失且无法恢复。 */
+      const nm = typeof b.name === 'string' ? b.name.trim() : ''
+      if (!nm) throw Object.assign(new Error('歌单名不能为空'), { code: 400 })
       const p = db.playlists.find((x) => x.id === b.id)
-      if (p) { p.name = b.name; saveDb() }
+      if (!p) throw Object.assign(new Error('歌单不存在'), { code: 404 })
+      p.name = nm.slice(0, 60)
+      saveDb()
       return { playlists: db.playlists }
     }
     if (action === 'delete') {
@@ -1157,7 +1190,8 @@ const routes = {
     }
     if (action === 'remove') {
       const p = db.playlists.find((x) => x.id === (b.listId || 'default'))
-      if (p) { p.songs = p.songs.filter((s) => s.id !== b.id); saveDb() }
+      /* P3: 只按 id 过滤会把其它平台同 id 的歌一起删掉（add 那边是带 source 判的） */
+      if (p) { p.songs = p.songs.filter((s) => !(s.id === b.id && (s.source || 'wy') === (b.source || 'wy'))); saveDb() }
       return { playlists: db.playlists }
     }
     if (action === 'clear') {
@@ -1169,19 +1203,45 @@ const routes = {
   },
 }
 
-function fetchText (url) {
+function fetchText (url, hops = 0, maxBytes = 2 * 1024 * 1024) {
+  /* P2: 原来跟随重定向没有任何跳数上限，一个自我重定向的地址能让服务端
+     在一次导入里连打 300 次 HTTP；chunks 也没有大小上限，能拉几百 MB 进内存。 */
   return new Promise((resolve, reject) => {
-    const u = new URL(url)
-    const lib = u.protocol === 'https:' ? https : http
-    lib.get(u, { headers: { 'User-Agent': UA }, timeout: 20000 }, (resp) => {
-      if (resp.statusCode >= 300 && resp.statusCode < 400 && resp.headers.location) {
+    if (hops > 5) return reject(Object.assign(new Error('重定向次数过多'), { code: 400 }))
+    let u = null
+    try { u = new URL(url) } catch (err) { return reject(Object.assign(new Error('地址无效'), { code: 400 })) }
+    if (!/^https?:$/.test(u.protocol)) return reject(Object.assign(new Error('只支持 http/https'), { code: 400 }))
+    if (isPrivateHost(u.hostname)) return reject(Object.assign(new Error('不允许访问内网地址'), { code: 400 }))
+
+    const req = http.get(u, { timeout: 20000, headers: { 'User-Agent': UA } }, (resp) => {
+      const code = resp.statusCode || 0
+      if (code >= 300 && code < 400 && resp.headers.location) {
         resp.resume()
-        return resolve(fetchText(new URL(resp.headers.location, u).toString()))
+        /* 相对地址要基于当前 URL 解析；用递归但带 hops 计数 */
+        let next = ''
+        try { next = new URL(resp.headers.location, u).toString() } catch (e) { return reject(Object.assign(new Error('重定向地址无效'), { code: 400 })) }
+        return resolve(fetchText(next, hops + 1, maxBytes))
+      }
+      if (code >= 400) {
+        resp.resume()
+        return reject(Object.assign(new Error('上游返回 ' + code), { code: 502 }))
       }
       const c = []
-      resp.on('data', (d) => c.push(d))
+      let size = 0
+      resp.on('data', (d2) => {
+        size += d2.length
+        if (size > maxBytes) {
+          try { resp.destroy() } catch (e2) { }
+          reject(Object.assign(new Error('内容过大（上限 ' + Math.round(maxBytes / 1024) + 'KB）'), { code: 400 }))
+          return
+        }
+        c.push(d2)
+      })
       resp.on('end', () => resolve(Buffer.concat(c).toString('utf8')))
-    }).on('error', reject)
+      resp.on('error', (e2) => reject(e2))
+    })
+    req.on('timeout', () => { try { req.destroy() } catch (e2) { } reject(Object.assign(new Error('下载超时'), { code: 504 })) })
+    req.on('error', (e2) => reject(e2))
   })
 }
 

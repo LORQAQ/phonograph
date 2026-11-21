@@ -75,6 +75,30 @@ static class Program
                         "留声 · Phonograph", MessageBoxButtons.OK, MessageBoxIcon.Error);
                     return;
                 }
+                /* P1: 只探测端口是不够的 —— 旧版残留的 node.exe、或任何占用 37621 的进程
+                   都会让外壳渲染「别人的页面/旧版本页面」，而外壳自身是新的。
+                   这正是「装了新版却看到旧功能」的另一条路径。 */
+                string sv = ServerVersion();
+                if (sv == null)
+                {
+                    MessageBox.Show("37621 端口上运行的不是留声的后台服务。\n请关闭占用该端口的程序后重试。",
+                        "留声 · Phonograph", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return;
+                }
+                if (sv != ShellVersion())
+                {
+                    var r = MessageBox.Show(
+                        "检测到旧版后台服务（" + sv + "，当前程序 " + ShellVersion() + "）。\n" +
+                        "继续使用可能出现功能异常。是否结束旧服务并重启？",
+                        "留声 · Phonograph", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
+                    if (r == DialogResult.Yes)
+                    {
+                        KillServerOnPort();
+                        Thread.Sleep(800);
+                        StartServer();
+                        WaitPort(20000);
+                    }
+                }
                 Application.Run(new MainForm());
             }
             finally
@@ -97,6 +121,80 @@ static class Program
             }
         }
         catch { return false; }
+    }
+
+    /** 读 /api/health 的 version；不是留声的服务就返回 null */
+    static string ServerVersion()
+    {
+        try
+        {
+            var req = (System.Net.HttpWebRequest)System.Net.WebRequest.Create("http://127.0.0.1:" + PORT + "/api/health");
+            req.Timeout = 3000;
+            req.ReadWriteTimeout = 3000;
+            using (var resp = (System.Net.HttpWebResponse)req.GetResponse())
+            using (var sr = new System.IO.StreamReader(resp.GetResponseStream()))
+            {
+                string body = sr.ReadToEnd();
+                var m = System.Text.RegularExpressions.Regex.Match(body, "\"version\"\\s*:\\s*\"([^\"]+)\"");
+                return m.Success ? m.Groups[1].Value : null;
+            }
+        }
+        catch { return null; }
+    }
+
+    /** 外壳自己的版本（编译时写进程序集） */
+    static string ShellVersion()
+    {
+        try
+        {
+            var asm = System.Reflection.Assembly.GetExecutingAssembly();
+            var attrs = asm.GetCustomAttributes(typeof(System.Reflection.AssemblyInformationalVersionAttribute), false);
+            if (attrs != null && attrs.Length > 0)
+            {
+                var a = (System.Reflection.AssemblyInformationalVersionAttribute)attrs[0];
+                if (!string.IsNullOrEmpty(a.InformationalVersion)) return a.InformationalVersion;
+            }
+            var v = asm.GetName().Version;
+            return v == null ? "0.0.0" : (v.Major + "." + v.Minor + "." + v.Build);
+        }
+        catch { return "0.0.0"; }
+    }
+
+    /** 杀掉监听 37621 的 node 进程 */
+    static void KillServerOnPort()
+    {
+        try
+        {
+            var psi = new ProcessStartInfo("netstat", "-ano")
+            { RedirectStandardOutput = true, UseShellExecute = false, CreateNoWindow = true };
+            using (var p = Process.Start(psi))
+            {
+                string outp = p.StandardOutput.ReadToEnd();
+                p.WaitForExit(4000);
+                foreach (var line in outp.Split('\n'))
+                {
+                    if (line.IndexOf(":" + PORT, StringComparison.Ordinal) < 0) continue;
+                    if (line.IndexOf("LISTENING", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                    var parts = line.Trim().Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+                    if (parts.Length < 5) continue;
+                    int pid;
+                    if (!int.TryParse(parts[parts.Length - 1], out pid)) continue;
+                    try { Process.GetProcessById(pid).Kill(); LogStatic("killed pid " + pid); } catch { }
+                }
+            }
+        }
+        catch (Exception e) { LogStatic("KillServerOnPort: " + e.Message); }
+    }
+
+    /** Program 类用的静态日志（Log 是 MainForm 的实例方法） */
+    static void LogStatic(string s)
+    {
+        try
+        {
+            string lp = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "phonograph-shell.log");
+            System.IO.File.AppendAllText(lp, DateTime.Now.ToString("HH:mm:ss") + " " + s + "\n");
+        }
+        catch { }
     }
 
     static void StartServer()
