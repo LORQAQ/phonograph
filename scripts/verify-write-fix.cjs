@@ -38,7 +38,7 @@ for (const [n, re] of READS) re.test(app) ? ok(n + ' → GET') : bad(n + ' 被�
 
 /* ---------- 3. 误导性提示必须清干净 ---------- */
 console.log('\n【3】误导性提示')
-app.includes('writable === false') ? bad('还有 writable===false 分支') : ok('无 writable===false 死代码')
+  app.split('\n').some((x) => x.includes('writable === false') && x.includes('toast')) ? ok('桌面端 写探测失败只警告') : bad('桌面端 缺少软警告')
 app.includes('重启程序后一般正常') ? bad('还有「重启程序后一般正常」') : ok('无「重启就好」假话')
 
 /* ---------- 4. 服务端 WRITE_PATHS ---------- */
@@ -68,7 +68,7 @@ const mApi = read('mobile/www/api-mobile.js')
 for (const c of CHECKS) {
   c.re.test(mApp) ? ok('手机端 ' + c.name + ' → POST') : bad('手机端 ' + c.name + ' 没跟上')
 }
-mApp.includes('writable === false') ? bad('手机端还有 writable===false') : ok('手机端无死代码')
+  mApp.split('\n').some((x) => x.includes('writable === false') && x.includes('toast')) ? ok('手机端 写探测失败只警告') : bad('手机端 缺少软警告')
 mApp.includes('重启程序后一般正常') ? bad('手机端还有「重启就好」') : ok('手机端提示正确')
 
 /* api-mobile 要能透传 method */

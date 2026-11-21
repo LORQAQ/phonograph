@@ -40,7 +40,8 @@ if (mode === 'finalize') {
   const hasVer = s.includes(asmVer) || s.includes(VERSION)
   console.log('  ' + (hasVer ? '✓' : '✗') + ' 程序集含版本串 ' + asmVer)
   /* 校验关键字符串都在 */
-  const NEED = ['Phonograph', 'api/health', '留声']
+  /* .NET 程序集里的字符串按 UTF-16LE 存，用 latin1 读出来每个字符间夹一个 \0 */
+  const NEED = ['Phonograph', 'a\u0000p\u0000i\u0000/\u0000h\u0000e\u0000a\u0000l\u0000t\u0000h', '留声']
   for (const n of NEED) {
     const ok = n === '留声' ? s.includes(Buffer.from(n, 'utf8').toString('latin1')) : s.includes(n)
     console.log('  ' + (ok ? '✓' : '✗') + ' 含 ' + n)

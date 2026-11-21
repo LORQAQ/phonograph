@@ -180,7 +180,6 @@ async function getSongPageAlt (globalId, page, pagesize) {
  *    get_other_list_file: name("歌手 - 歌名") / timelen(毫秒) / singerinfo[] / albuminfo
  */
 function mapKgSong (x) {
-  if (!x || typeof x !== 'object') return null
   const hash = String(x.hash || x.FileHash || '')
   if (!hash) return null
 

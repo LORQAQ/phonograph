@@ -241,7 +241,7 @@ class SourceManager {
     if (!cands.length) throw new Error(only ? ('指定音源不可用：' + only) : ('没有可用的音源脚本支持 ' + platform))
 
     const attempts = []
-    /* P3: 用模块级常量，别在函数里再遮蔽一份（改一处漏一处的温床） */
+    const QUALITY_ORDER = ['flac24bit', 'flac', '320k', '192k', '128k']
 
     /* 每个源只试"首选 + 降级一档"，并行发起，谁先成功用谁 */
     const task = (c) => async () => {

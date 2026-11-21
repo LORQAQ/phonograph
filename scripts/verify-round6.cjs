@@ -48,19 +48,11 @@ console.log('【1】isPrivateHost（从源码抽出实测）')
   }
 }
 
-/* ============ 2. btnRecImport 绑定 ============ */
-console.log('\n【2】#btnRecImport 绑定')
-{
-  const s = fs.readFileSync('public/app.js', 'utf8')
-  const hasSel = s.includes("$('#btnRecImport')")
-  const hasBind = s.includes('__ri.onclick')
-  ;(hasSel && hasBind) ? ok('已有 onclick 绑定') : bad('#btnRecImport', 'sel=' + hasSel + ' bind=' + hasBind)
-  /* 确认 pendingRec 和 importFromCard 都存在 */
-  const hasPending = s.includes('pendingRec')
-  const hasImport = s.includes('function importFromCard') || s.includes('importFromCard =')
-  hasPending ? ok('pendingRec 存在') : bad('pendingRec', '未定义')
-  hasImport ? ok('importFromCard 存在') : bad('importFromCard', '未定义')
-}
+/* ============ 2. 推荐歌单死弹窗已移除 ============ */
+console.log("\n【2】推荐歌单死弹窗")
+const __html2 = fs.readFileSync('public/index.html', 'utf8')
+const __deadGone = !__html2.includes("overlayRec") && !__html2.includes("btnRecImport")
+__deadGone ? ok("死弹窗已从 HTML 移除") : bad("推荐歌单死弹窗", "还在 HTML 里")
 
 /* ============ 3. renderDownloadsView 复位 state.view ============ */
 console.log('\n【3】renderDownloadsView 复位 state.view')

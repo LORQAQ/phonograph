@@ -26,8 +26,7 @@ function parseMeta (code) {
   const meta = { name: '未命名音源', description: '', version: '', author: '', homepage: '' }
   const head = code.slice(0, 4000)
   const pick = (key) => {
-      /* P3: 值里不能再吃 @ —— 否则一行写多个标签时 name 会吞掉整行 */
-    const m = head.match(new RegExp('@' + key + '\\s+([^\\r\\n*@]+)'))
+    const m = head.match(new RegExp('@' + key + '\\s+([^\\r\\n*]+)'))
     return m ? m[1].trim() : ''
   }
   for (const k of ['name', 'description', 'version', 'author', 'homepage']) {

@@ -647,7 +647,7 @@ input[type=checkbox]{accent-color:var(--brass)}
   overscroll-behavior:contain;
 }
   body.m-deck .deck .plinth{max-width:300px;margin:0 auto}
-  /* .vinyl-zone{max-width:250px} 已删除：和 max-height 冲突导致椭圆 */
+  body.m-deck /* .vinyl-zone{max-width:250px} 已删除：和 max-height 冲突导致椭圆 */
   body.m-deck .deck-tabs{margin-top:10px}
   .deck-plate{font-size:9px;letter-spacing:.6px;gap:8px}
   .deck-plate span:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -1400,12 +1400,3 @@ button:focus,select:focus,a:focus{outline:none}
 @media (max-width:1180px), (max-height:720px){
   .lyric-roll .ll{font-size:13px;line-height:1.7}
 }
-
-
-/* ---- 音量百分比（之前 #volNum 是幽灵元素，代码在写但 DOM 里没有）---- */
-.vol-num{font-size:11px;color:var(--text-3);min-width:22px;text-align:center;font-variant-numeric:tabular-nums}
-
-/* ---- 歌词工具（字号 / 偏移）---- */
-.lyric-tools{display:flex;align-items:center;gap:6px;margin-left:8px}
-.lyric-tools .btn-mini{font-size:11px;padding:2px 7px;min-width:0}
-.lrc-offset-tip{font-size:11px;color:var(--text-3);min-width:44px}

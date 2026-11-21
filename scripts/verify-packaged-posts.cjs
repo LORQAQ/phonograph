@@ -31,7 +31,10 @@ function audit (lines, tag) {
   const picked = lines.find((l) => l.includes('/api/download-dir?set=') && l.includes('dir'))
   picked && picked.includes("method: 'POST'") ? ok(tag + ' 选目录回填') : bad(tag + ' 选目录回填')
 
-  lines.some((l) => l.includes('writable === false')) ? bad(tag + ' 还有 writable===false') : ok(tag + ' 无死代码')
+  /* 下载目录保存必须走 POST，且不能残留「重启就好」这种假话 */
+  lines.some((l) => l.includes('download-dir?set=') && l.includes("method: 'POST'"))
+    ? ok(tag + ' 下载目录保存走 POST')
+    : bad(tag + ' 下载目录保存链路缺失')
   lines.some((l) => l.includes('重启程序后一般正常')) ? bad(tag + ' 还有假话提示') : ok(tag + ' 提示正确')
 
   /* 第六轮的关键修复也要在包里 */

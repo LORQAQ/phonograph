@@ -53,19 +53,9 @@ function fmtDuration (ms) {
   return String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0')
 }
 
-/* P2: ar/al 可能是对象或字符串，条目可能是 null */
-function toArr (v) {
-  if (Array.isArray(v)) return v.filter((x) => x && typeof x === 'object')
-  if (v && typeof v === 'object') return [v]
-  if (typeof v === 'string' && v) return [{ name: v }]
-  return []
-}
-
 function mapSong (s) {
-  if (!s || typeof s !== 'object') return null
-  const ar = toArr(s.ar || s.artists)
-  const alRaw = s.al || s.album
-  const al = (alRaw && typeof alRaw === 'object') ? alRaw : {}
+  const ar = s.ar || s.artists || []
+  const al = s.al || s.album || {}
   const picStr = al.pic_str || al.pic || (al.picUrl ? extractPicId(al.picUrl) : '')
   return {
     id: String(s.id),
@@ -73,7 +63,7 @@ function mapSong (s) {
     lyricId: String(s.id),
     picId: picStr ? String(picStr) : '',
     name: s.name || '未知歌曲',
-    singer: ar.map((a) => a && a.name).filter(Boolean).join(' / ') || '未知歌手',
+    singer: ar.map((a) => a.name).join(' / ') || '未知歌手',
     album: al.name || '',
     albumId: al.id ? String(al.id) : '',
     cover: al.picUrl || '',
