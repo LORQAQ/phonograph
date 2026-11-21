@@ -647,7 +647,9 @@ input[type=checkbox]{accent-color:var(--brass)}
   overscroll-behavior:contain;
 }
   body.m-deck .deck .plinth{max-width:300px;margin:0 auto}
-  body.m-deck /* .vinyl-zone{max-width:250px} 已删除：和 max-height 冲突导致椭圆 */
+  /* 下面这条原来写成了 `body.m-deck /* 注释 */ body.m-deck .deck-tabs`，
+     注释被当成顺序分隔符，两条选择器被拼成后代选择器（DOM 里不可能命中）。
+     注释必须独占一行。 */
   body.m-deck .deck-tabs{margin-top:10px}
   .deck-plate{font-size:9px;letter-spacing:.6px;gap:8px}
   .deck-plate span:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -1177,11 +1179,16 @@ button:focus,select:focus,a:focus{outline:none}
    大屏 1920 也吃不到那个断点 —— 结果黑胶还是占掉一半屏。
    这里改成所有宽度都给一个上限，用 vh 保证竖向永远有余量。 */
 
-.deck{
-  display:flex;
-  flex-direction:column;
-  min-height:0;
-  overflow:hidden;
+/* 只对宽屏生效。
+   原来这段是无条件的，写在文件末尾 —— 它把 636 行的 `.deck{display:none}` 覆盖了，
+   于是窗口变窄时右侧面板不隐藏，和中间内容、底部标签栏挤在一起（布局整个塌掉）。
+   另外它的 overflow:hidden 也会盖掉窄屏全屏播放页需要的 overflow-y:auto，导致那页不能滚。 */
+@media (min-width:861px){
+  .deck{
+    flex-direction:column;
+    min-height:0;
+    overflow:hidden;
+  }
 }
 .deck-vinyl,
 .deck > .plinth{
