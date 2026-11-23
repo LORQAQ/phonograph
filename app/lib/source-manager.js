@@ -278,20 +278,41 @@ class SourceManager {
       throw new Error('no url')
     }
 
+    /* 目标音质在降级链里的排名（数字越小音质越高）*/
+    const wantIdx = QUALITY_ORDER.indexOf(wantedQuality || '320k')
+
     const winner = await new Promise((resolve) => {
       let settled = false
       let pending = cands.length
-      const timer = setTimeout(() => { if (!settled) { settled = true; resolve(null) } }, 24000)   /* B17: tries 最多 2 档，每档 5000(call)+6000(probe)=11000，
+      /* 已经成功、但音质低于目标的源。先留着当兜底，
+         不能一拿到就返回 —— Free listen 只支持 128k 却响应最快，
+         原来它永远抢先，导致用户选 320k/无损也一直是 128k。 */
+      let fallback = null
+      let timer = null
+      const finish = (v) => {
+        if (settled) return
+        settled = true
+        if (timer) clearTimeout(timer)
+        resolve(v)
+      }
+      const oneDone = () => {
+        if (settled) return
+        if (--pending === 0) finish(fallback)
+      }
+      timer = setTimeout(() => finish(fallback), 24000)   /* B17: tries 最多 2 档，每档 5000(call)+6000(probe)=11000，
                                      两档最坏 22000。原来 12000 盖不住，会把「第一档超时、第二档能成」的慢源判死 */
       cands.forEach((c) => {
         task(c)().then((v) => {
           if (settled) return
-          settled = true
-          clearTimeout(timer)
-          resolve(v)
-        }).catch(() => {
-          if (--pending === 0 && !settled) { settled = true; clearTimeout(timer); resolve(null) }
-        })
+          const gotIdx = QUALITY_ORDER.indexOf(v.quality)
+          /* 达到或超过目标音质 → 立刻采用 */
+          if (wantIdx < 0 || gotIdx < 0 || gotIdx <= wantIdx) return finish(v)
+          /* 低于目标：先当备用，继续等更好的源。
+             备用也要取音质最高的那个 —— 否则请求 flac24bit 没有源能给时，
+             会退回最先到的 128k，而不是已经拿到的 flac。 */
+          if (!fallback || gotIdx < QUALITY_ORDER.indexOf(fallback.quality)) fallback = v
+          oneDone()
+        }).catch(() => oneDone())
       })
     })
 

@@ -639,8 +639,11 @@ async function mobileApi (path, opts = {}) {
       const id = q.get('id')
       if (!id) throw new Error('缺少歌曲 id')
       const source = q.get('source') || 'wy'
-      const wantFormat = q.get('format') === 'flac' ? 'flac' : 'mp3'
-      const quality = wantFormat === 'flac' ? 'flac' : (q.get('quality') || '320k')
+      /* 播放音质只看用户选的档位。
+         原来这里写成 `format==='flac' ? 'flac' : ...`，
+         把「下载格式」当成了播放音质 —— 用户把下载格式设成 FLAC 后，
+         所有播放都被强制成 flac，选 320k 也不生效。 */
+      const quality = q.get('quality') || '320k'
       const mi = {
         musicId: id,
         id,

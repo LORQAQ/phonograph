@@ -425,7 +425,10 @@
       const __fishOk = (!only || only === 'fish') && !(this.disabled && this.disabled.has && this.disabled.has('fish'))
       const fishScript = __fishOk ? this.scripts.get('fish') : null
       if (fishScript) {
-        const qs = quality === 'flac' ? ['flac', '320k', '128k'] : ['320k', '128k', 'flac']
+        /* 尊重用户选的音质。
+           原来写死成 ['320k','128k','flac']，选 flac24bit 也永远拿不到。
+           现在把目标音质排在最前，再按常见档位补后面几档当降级。 */
+        const qs = Array.from(new Set([quality || '320k', 'flac', '320k', '128k'])).filter(Boolean)
         for (let attempt = 0; attempt < 3; attempt++) {
           const q2 = qs[attempt] || quality
           try {
@@ -468,23 +471,33 @@
         }
       })
 
-      /* 谁先返回可用结果就赢 */
+      /* 与电脑端一致：不接受低于目标音质的结果当赢家。
+         原来「谁先返回谁赢」，freelisten 只支持 128k 却最快，
+         于是用户选 320k/无损也一直是 128k。
+         改为：达到目标的立刻赢；低于目标的先当备用（取音质最好的），
+         等所有源都结束或总超时才退回备用。 */
+      const QO = ['flac24bit', 'hires', 'master', 'atmos', 'atmos_plus', 'flac', '320k', '192k', '128k']
+      const wantIdx = QO.indexOf(quality || '320k')
+
       const winner = await new Promise((resolve) => {
         let pending = tasks.length
         let done = false
+        let fallback = null
+        const finish = (v) => { if (done) return; done = true; resolve(v) }
+        const oneDone = () => { if (done) return; if (--pending <= 0) finish(fallback) }
         if (!pending) return resolve(null)
         tasks.forEach((t) => {
           t.then((r) => {
-            pending--
-            if (r && !done) { done = true; resolve(r) }
-            else if (!pending && !done) { done = true; resolve(null) }
-          }).catch(() => {
-            pending--
-            if (!pending && !done) { done = true; resolve(null) }
-          })
+            if (done) return
+            if (!r) return oneDone()
+            const gotIdx = QO.indexOf(r.quality)
+            if (wantIdx < 0 || gotIdx < 0 || gotIdx <= wantIdx) return finish(r)
+            if (!fallback || gotIdx < QO.indexOf(fallback.quality)) fallback = r
+            oneDone()
+          }).catch(() => oneDone())
         })
-        /* 总超时 20 秒 */
-        setTimeout(() => { if (!done) { done = true; resolve(null) } }, 8000)
+        /* 总超时 8 秒 */
+        setTimeout(() => finish(fallback), 8000)
       })
 
       return winner
