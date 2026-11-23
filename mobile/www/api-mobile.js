@@ -244,10 +244,10 @@
           songmid: id,
           songId: id,
           hash: id,
-          name: '',
-          singer: '',
-          albumName: '',
-          interval: '00:00',
+          name: q.get('name') || '',
+          singer: q.get('singer') || '',
+          albumName: q.get('album') || '',
+          interval: q.get('interval') || '',
           _types: {},
         }
         const hit = await M.resolve(source, mi, quality, '')

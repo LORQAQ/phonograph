@@ -519,7 +519,7 @@ const routes = {
 
   async '/api/health' () {
     return {
-      ok: true, version: '1.0.34', pid: process.pid, platform: process.platform,
+      ok: true, version: '1.0.35', pid: process.pid, platform: process.platform,
       /* B7: 外壳/前端可以拿这个 token 带 X-Phonograph-Token 头 */
       token: SESSION_TOKEN,
     }
@@ -575,6 +575,9 @@ const routes = {
       id, source: platform, quality: result.quality, provider: result.provider,
       sourceId: result.sourceId, url: result.url, attempts: result.attempts,
       crossPlatform: crossFrom || undefined,
+      /* 全网只有试听片段时带上这个标记，前端会显示「仅试听」 */
+      clip: result.clip || undefined,
+      clipSec: result.clipSec ? Math.round(result.clipSec) : undefined,
     }
       cacheSet(urlCache, cacheKey, payload, 5 * 60e3, 300)
       return payload

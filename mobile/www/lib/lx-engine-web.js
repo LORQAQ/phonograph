@@ -373,6 +373,16 @@
 
     /** 依次尝试脚本取流，优先返回 https 官方 CDN 地址 */
     async resolve (platform, info, quality, only) {
+      /* 这首歌应该多长（秒）。用来识别试听片段。 */
+      const expectedSec = (function (v) {
+        if (typeof v === 'number' && isFinite(v)) return v > 10000 ? v / 1000 : v
+        const t = String(v == null ? '' : v).trim()
+        if (!t) return 0
+        const m = t.match(/^(\d{1,3}):(\d{1,2})$/)
+        if (m) return Number(m[1]) * 60 + Number(m[2])
+        const n = Number(t)
+        return isFinite(n) && n > 0 ? (n > 10000 ? n / 1000 : n) : 0
+      })(info && (info.interval || info.duration))
       const withTimeout = (promise, ms) => Promise.race([
         promise,
         new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ms)),
@@ -399,7 +409,40 @@
           console.warn('[取流] 格式不支持，跳过', url.slice(-40))
           return false
         }
-        /* 不再做网络探测：HEAD 常被 CDN 拒，会误杀可用地址 */
+        /* 不再做完整网络探测：HEAD 常被 CDN 拒，会误杀可用地址。
+           但要做「时长」校验 —— VIP/版权歌很多源只给 15~30 秒试听片段，
+           文件头完全正常，只有大小能看出来。 */
+        if (expectedSec > 0 && typeof window !== 'undefined' && window.NAPI && window.NAPI.httpAsync) {
+          try {
+            const head = await new Promise((r) => {
+              let done = false
+              const fin = (v) => { if (!done) { done = true; r(v) } }
+              setTimeout(() => fin(null), 4000)
+              try {
+                window.NAPI.httpAsync('lyric-probe-' + Math.random().toString(36).slice(2), url, 'GET',
+                  JSON.stringify({ Range: 'bytes=0-1' }),
+                  function (payload) {
+                    try { fin(JSON.parse(payload)) } catch (e) { fin(null) }
+                  })
+              } catch (e) { fin(null) }
+            })
+            const h = (head && head.headers) || {}
+            const cr = String(h['content-range'] || h['Content-Range'] || '')
+            const cl = Number(h['content-length'] || h['Content-Length'] || 0)
+            let total = 0
+            const m = cr.match(/\/(\d+)/)
+            if (m) total = Number(m[1])
+            else if (cl) total = cl
+            if (total > 0) {
+              const br = (quality === 'flac' || quality === 'flac24bit') ? 900000 : 320000
+              const est = (total * 8) / br
+              if (est < 45 || est < expectedSec * 0.75) {
+                console.warn('[取流] 疑似试听片段，跳过', Math.round(est) + 's / ' + Math.round(expectedSec) + 's')
+                return false
+              }
+            }
+          } catch (e) { /* 探测失败就放行，别误杀 */ }
+        }
         return true
       }
 

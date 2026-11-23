@@ -33,6 +33,17 @@ function editDist (a, b) {
   return prev[b.length]
 }
 
+/** "4:55" / "295" / 295000 → 秒。解析不出来返回 0 */
+function parseDur (v) {
+  if (typeof v === 'number' && isFinite(v)) return v > 10000 ? v / 1000 : v
+  const t = String(v == null ? '' : v).trim()
+  if (!t) return 0
+  const m = t.match(/^(\d{1,3}):(\d{1,2})$/)
+  if (m) return Number(m[1]) * 60 + Number(m[2])
+  const n = Number(t)
+  return isFinite(n) && n > 0 ? (n > 10000 ? n / 1000 : n) : 0
+}
+
 /* 两首歌名是否可能是同一首 */
 function similarName (a, b) {
   const x = norm(a)
@@ -98,8 +109,21 @@ module.exports = async function resolveWithCross (ctx) {
         /* B4: 必须先确认是同一首歌，再取流 */
         if (!similarName(s2.name, origName)) continue
         if (!similarSinger(s2.singer, info.singer)) continue
+        /* 时长对不上的候选不再直接跳过 —— 那会导致「本来有个试听片段可放，
+           被我挡成完全放不了」。片段识别交给 resolveUrl 里的音频时长校验：
+           完整版优先，只有片段时以 clip:true 返回，前端标「仅试听」。 */
+        const origSec = parseDur(info && info.interval)
+        const candSec = Number(s2.duration) > 0 ? Number(s2.duration) / 1000 : parseDur(s2.durationText)
+        const durMismatch = origSec > 0 && candSec > 0 && Math.abs(candSec - origSec) > Math.max(20, origSec * 0.4)
         try {
-          const alt = await buildMusicInfo(plat, s2.id, { name: s2.name, singer: s2.singer, album: s2.album })
+          /* interval 用**原曲**的时长，不是候选的 ——
+             片段校验要靠它。用候选自己的时长，那「48 秒的片段自称 48 秒」就会混过去。 */
+          const alt = await buildMusicInfo(plat, s2.id, {
+            name: s2.name,
+            singer: s2.singer,
+            album: s2.album,
+            interval: (info && info.interval) || s2.durationText || '',
+          })
           const r2 = await sourceManager.resolveUrl(plat, alt, quality, only)
           if (r2 && r2.url) {
             return {

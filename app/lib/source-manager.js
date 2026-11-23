@@ -22,7 +22,59 @@ function callWithTimeout (fn, ms = 5000) {
  * 只淘汰「明确 4xx/5xx」和「明确返回 HTML 错误页」的地址；
  * Content-Type 缺失、HEAD 不支持、403 防盗链（浏览器带 Referer 可播）一律放行。
  */
-function probeUrl (url, timeout = 8000) {
+/** 把 "4:55" / "04:55" / "295" 解析成秒；解析不出来返回 0 */
+function parseInterval (v) {
+  if (typeof v === 'number' && isFinite(v)) return v > 10000 ? v / 1000 : v
+  const s = String(v == null ? '' : v).trim()
+  if (!s) return 0
+  const m = s.match(/^(\d{1,3}):(\d{1,2})$/)
+  if (m) return Number(m[1]) * 60 + Number(m[2])
+  const n = Number(s)
+  return isFinite(n) && n > 0 ? (n > 10000 ? n / 1000 : n) : 0
+}
+
+/** 各档音质的标称码率，用来从文件大小反推时长 */
+function nominalBitrate (quality) {
+  if (quality === 'flac' || quality === 'flac24bit' || quality === 'hires' || quality === 'master') return 900000
+  if (quality === '320k') return 320000
+  if (quality === '192k') return 192000
+  if (quality === '128k') return 128000
+  return 320000
+}
+
+/** 量一下这个地址的音频有多长（秒）。拿不到返回 0。 */
+function clipLength (url, quality) {
+  return new Promise((resolve) => {
+    let done = false
+    const fin = (v) => { if (!done) { done = true; resolve(v) } }
+    let u
+    try { u = new URL(url) } catch (e) { return fin(0) }
+    const lib = u.protocol === 'https:' ? require('node:https') : require('node:http')
+    const req = lib.request(u, {
+      method: 'GET',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/126.0.0.0',
+        Accept: '*/*',
+        Range: 'bytes=0-1',
+      },
+      timeout: 8000,
+    }, (res) => {
+      const cr = String(res.headers['content-range'] || '')
+      const cl = Number(res.headers['content-length'] || 0)
+      let total = 0
+      const m = cr.match(/\/(\d+)/)
+      if (m) total = Number(m[1])
+      else if (cl) total = cl
+      res.resume()
+      fin(total > 0 ? (total * 8) / nominalBitrate(quality) : 0)
+    })
+    req.on('timeout', () => { try { req.destroy() } catch (e) { } fin(0) })
+    req.on('error', () => fin(0))
+    req.end()
+  })
+}
+
+function probeUrl (url, timeout = 8000, expectedSec = 0, quality = '320k') {
   /* 网易云外链是 302 占位，播放必失败 */
   if (/music\.163\.com\/song\/media\/outer/i.test(String(url || ''))) return false
   /* WebView 的 <audio> 只稳支持 mp3/m4a/flac/ogg，
@@ -42,6 +94,27 @@ function probeUrl (url, timeout = 8000) {
         timeout: Math.max(3000, timeout - 1500),
       }, (res) => {
         if (res.statusCode >= 400 && res.statusCode !== 206) { res.resume(); return done(false) }
+
+        /* 时长校验：很多源对 VIP/版权歌只给 15~30 秒试听片段，
+           文件头完全正常，只有大小能看出来。这里按码率反推时长，
+           明显短于歌曲长度就判无效，换下一个源。 */
+        if (expectedSec > 0) {
+          const cr = String(res.headers['content-range'] || '')
+          const cl = Number(res.headers['content-length'] || 0)
+          let total = 0
+          const m = cr.match(/\/(\d+)/)
+          if (m) total = Number(m[1])
+          else if (cl) total = cl
+          if (total > 0) {
+            const estSec = (total * 8) / nominalBitrate(quality)
+            /* 绝对太短（<45 秒）或不到目标时长的 55%，都当片段 */
+            if (estSec < 45 || estSec < expectedSec * 0.75) {
+              try { res.destroy() } catch (e) { }
+              return done(false)
+            }
+          }
+        }
+
         let judged = false
         res.on('data', (chunk) => {
           if (judged) return
@@ -241,6 +314,9 @@ class SourceManager {
     if (!cands.length) throw new Error(only ? ('指定音源不可用：' + only) : ('没有可用的音源脚本支持 ' + platform))
 
     const attempts = []
+    /* 这首歌应该有多长。用来识别「试听片段」——
+       VIP/版权歌很多源只给 15~30 秒，文件头正常，只有大小能看出来。 */
+    const expectedSec = parseInterval(musicInfo && (musicInfo.interval || musicInfo.duration))
     const QUALITY_ORDER = ['flac24bit', 'flac', '320k', '192k', '128k']
 
     /* 每个源只试"首选 + 降级一档"，并行发起，谁先成功用谁 */
@@ -259,11 +335,20 @@ class SourceManager {
           const ms = Date.now() - t0
           if (typeof url === 'string' && /^https?:\/\//.test(url)) {
             /* 拿到的地址先验一次，404 之类直接换源，别把坏地址交给播放器 */
-            const alive = await probeUrl(url, 6000)
+            const alive = await probeUrl(url, 6000, expectedSec, q)
             if (alive) {
               this.recordResult(c.id, platform, true, ms)
               attempts.push({ id: c.id, name: entry.meta.name, quality: q, ok: true, ms })
               return { url, quality: q, provider: entry.meta.name, sourceId: c.id, attempts }
+            }
+            /* 被拒了，但地址本身可能是「能播的试听片段」。
+               很多 VIP/版权歌全网都没有完整版，只给 15~30 秒。
+               记下来当兜底，并且明确标 clip:true —— 前端会显示「试听」，
+               总比「所有音源均失败」什么都不给要好。 */
+            const clipSec = await clipLength(url, q)
+            if (clipSec > 5) {
+              attempts.push({ id: c.id, name: entry.meta.name, quality: q, ok: false, ms, error: '只有试听(' + Math.round(clipSec) + 's)' })
+              return { url, quality: q, provider: entry.meta.name, sourceId: c.id, attempts, clip: true, clipSec }
             }
             this.recordResult(c.id, platform, false, ms)
             attempts.push({ id: c.id, name: entry.meta.name, quality: q, ok: false, ms, error: '地址不可用' })
@@ -288,6 +373,8 @@ class SourceManager {
          不能一拿到就返回 —— Free listen 只支持 128k 却响应最快，
          原来它永远抢先，导致用户选 320k/无损也一直是 128k。 */
       let fallback = null
+      /* 只有试听片段的候选，优先级最低：完整版 > 低音质完整版 > 试听片段 */
+      let clipFallback = null
       let timer = null
       const finish = (v) => {
         if (settled) return
@@ -297,13 +384,18 @@ class SourceManager {
       }
       const oneDone = () => {
         if (settled) return
-        if (--pending === 0) finish(fallback)
+        if (--pending === 0) finish(fallback || clipFallback)
       }
-      timer = setTimeout(() => finish(fallback), 24000)   /* B17: tries 最多 2 档，每档 5000(call)+6000(probe)=11000，
+      timer = setTimeout(() => finish(fallback || clipFallback), 24000)   /* B17: tries 最多 2 档，每档 5000(call)+6000(probe)=11000，
                                      两档最坏 22000。原来 12000 盖不住，会把「第一档超时、第二档能成」的慢源判死 */
       cands.forEach((c) => {
         task(c)().then((v) => {
           if (settled) return
+          /* 试听片段永远不能当赢家 */
+          if (v.clip) {
+            if (!clipFallback) clipFallback = v
+            return oneDone()
+          }
           const gotIdx = QUALITY_ORDER.indexOf(v.quality)
           /* 达到或超过目标音质 → 立刻采用 */
           if (wantIdx < 0 || gotIdx < 0 || gotIdx <= wantIdx) return finish(v)

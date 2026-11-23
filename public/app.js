@@ -197,7 +197,7 @@ function enhanceSelect (sel) {
 }
 
 /* ================= 版本与检查更新 ================= */
-const APP_VERSION = '1.0.34'
+const APP_VERSION = '1.0.35'
 const GH_OWNER = 'LORQAQ'
 const GH_REPO = 'phonograph'
 const GH_RELEASES = 'https://github.com/' + GH_OWNER + '/' + GH_REPO + '/releases/latest'
@@ -963,8 +963,10 @@ async function startSong (song, only) {
     } else {
       const info = await api('/api/url?' + songParams(song, only).toString())
       if (token !== state.playToken) return
-      state.urlCache.set(ck, { provider: info.provider, quality: info.quality, ts: Date.now() })
-      setSrc(info.provider + ' · ' + info.quality)
+      state.urlCache.set(ck, { provider: info.provider, quality: info.quality, clip: !!info.clip, ts: Date.now() })
+      /* 全网只有试听片段时也照放，但明确标出来 —— 免得用户以为只放 15 秒是坏 */
+      setSrc(info.provider + ' · ' + info.quality + (info.clip ? ' · 仅试听' : ''))
+      if (info.clip) toast('这首全网只有试听片段（约 ' + Math.round(info.clipSec || 15) + ' 秒），完整版需要会员', 4200)
     }
   } catch (e) {
     if (token !== state.playToken) return
